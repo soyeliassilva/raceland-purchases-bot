@@ -1,0 +1,188 @@
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Consultas Factura Electrónica - Verificación e-NCF</title>
+
+
+
+    <link rel="stylesheet" href="https://ajax.aspnetcdn.com/ajax/bootstrap/3.3.7/css/bootstrap.min.css">
+    <meta name="x-stylesheet-fallback-test" content="" class="sr-only">
+    <script>!function (a, b, c, d) { var e, f = document, g = f.getElementsByTagName("SCRIPT"), h = g[g.length - 1].previousElementSibling, i = f.defaultView && f.defaultView.getComputedStyle ? f.defaultView.getComputedStyle(h) : h.currentStyle; if (i && i[a] !== b) for (e = 0; e < c.length; e++)f.write('<link href="' + c[e] + '" ' + d + "/>") }("position", "absolute", ["/eCF/ConsultaTimbre/lib/bootstrap/dist/css/bootstrap.min.css"], "rel=\u0022stylesheet\u0022 ");</script>
+    <link href="/eCF/ConsultaTimbre/lib/bootstrap/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="/eCF/ConsultaTimbre/css/site.min.css?v=kHvJwvVAK1eJLN4w8xygUR3nbvlLmRwi5yr-OuAO90E">
+
+</head>
+
+<body>
+    <script>
+        function string_to_array(str) { var len = str.length; var res = new Array(len); for (var i = 0; i < len; i++)res[i] = str.charCodeAt(i); return res; } function array_to_hex_string(ary) { var res = ""; for (var i = 0; i < ary.length; i++)res += SHA256_hexchars[ary[i] >> 4] + SHA256_hexchars[ary[i] & 0x0f]; return res; } function SHA256_init() { SHA256_H = new Array(0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19); SHA256_buf = new Array(); SHA256_len = 0; } function SHA256_write(msg) { if (typeof (msg) == "string") SHA256_buf = SHA256_buf.concat(string_to_array(msg)); else SHA256_buf = SHA256_buf.concat(msg); for (var i = 0; i + 64 <= SHA256_buf.length; i += 64) SHA256_Hash_Byte_Block(SHA256_H, SHA256_buf.slice(i, i + 64)); SHA256_buf = SHA256_buf.slice(i); SHA256_len += msg.length; } function SHA256_finalize() { SHA256_buf[SHA256_buf.length] = 0x80; if (SHA256_buf.length > 64 - 8) { for (var i = SHA256_buf.length; i < 64; i++)SHA256_buf[i] = 0; SHA256_Hash_Byte_Block(SHA256_H, SHA256_buf); SHA256_buf.length = 0; } for (var i = SHA256_buf.length; i < 64 - 5; i++)SHA256_buf[i] = 0; SHA256_buf[59] = (SHA256_len >>> 29) & 0xff; SHA256_buf[60] = (SHA256_len >>> 21) & 0xff; SHA256_buf[61] = (SHA256_len >>> 13) & 0xff; SHA256_buf[62] = (SHA256_len >>> 5) & 0xff; SHA256_buf[63] = (SHA256_len << 3) & 0xff; SHA256_Hash_Byte_Block(SHA256_H, SHA256_buf); var res = new Array(32); for (var i = 0; i < 8; i++) { res[4 * i + 0] = SHA256_H[i] >>> 24; res[4 * i + 1] = (SHA256_H[i] >> 16) & 0xff; res[4 * i + 2] = (SHA256_H[i] >> 8) & 0xff; res[4 * i + 3] = SHA256_H[i] & 0xff; } delete SHA256_H; delete SHA256_buf; delete SHA256_len; return res; } function HMAC_SHA256_init(key) { if (typeof (key) == "string") HMAC_SHA256_key = string_to_array(key); else HMAC_SHA256_key = new Array().concat(key); if (HMAC_SHA256_key.length > 64) { SHA256_init(); SHA256_write(HMAC_SHA256_key); HMAC_SHA256_key = SHA256_finalize(); } for (var i = HMAC_SHA256_key.length; i < 64; i++)  HMAC_SHA256_key[i] = 0; for (var i = 0; i < 64; i++) HMAC_SHA256_key[i] ^= 0x36; SHA256_init(); SHA256_write(HMAC_SHA256_key); } function HMAC_SHA256_write(msg) { SHA256_write(msg); } function HMAC_SHA256_finalize() { var md = SHA256_finalize(); for (var i = 0; i < 64; i++) HMAC_SHA256_key[i] ^= 0x36 ^ 0x5c; SHA256_init(); SHA256_write(HMAC_SHA256_key); SHA256_write(md); for (var i = 0; i < 64; i++)    HMAC_SHA256_key[i] = 0; delete HMAC_SHA256_key; return SHA256_finalize(); } function HMAC_SHA256_MAC(key, msg) { var res; HMAC_SHA256_init(key); HMAC_SHA256_write(msg); res = HMAC_SHA256_finalize(); return array_to_hex_string(res); } SHA256_hexchars = new Array('0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'); SHA256_K = new Array(0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2); function SHA256_sigma0(x) { return ((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3); } function SHA256_sigma1(x) { return ((x >>> 17) | (x << 15)) ^ ((x >>> 19) | (x << 13)) ^ (x >>> 10); } function SHA256_Sigma0(x) { return ((x >>> 2) | (x << 30)) ^ ((x >>> 13) | (x << 19)) ^ ((x >>> 22) | (x << 10)); } function SHA256_Sigma1(x) { return ((x >>> 6) | (x << 26)) ^ ((x >>> 11) | (x << 21)) ^ ((x >>> 25) | (x << 7)); } function SHA256_Ch(x, y, z) { return z ^ (x & (y ^ z)); } function SHA256_Maj(x, y, z) { return (x & y) ^ (z & (x ^ y)); } function SHA256_Hash_Word_Block(H, W) { for (var i = 16; i < 64; i++)  W[i] = (SHA256_sigma1(W[i - 2]) + W[i - 7] + SHA256_sigma0(W[i - 15]) + W[i - 16]) & 0xffffffff; var state = new Array().concat(H); for (var i = 0; i < 64; i++) { var T1 = state[7] + SHA256_Sigma1(state[4]) + SHA256_Ch(state[4], state[5], state[6]) + SHA256_K[i] + W[i]; var T2 = SHA256_Sigma0(state[0]) + SHA256_Maj(state[0], state[1], state[2]); state.pop(); state.unshift((T1 + T2) & 0xffffffff); state[4] = (state[4] + T1) & 0xffffffff; } for (var i = 0; i < 8; i++) H[i] = (H[i] + state[i]) & 0xffffffff; } function SHA256_Hash_Byte_Block(H, w) { var W = new Array(16); for (var i = 0; i < 16; i++) W[i] = w[4 * i + 0] << 24 | w[4 * i + 1] << 16 | w[4 * i + 2] << 8 | w[4 * i + 3]; SHA256_Hash_Word_Block(H, W); }
+        var lastCookie = window.name;
+        function getCookie(name) {
+            let cookie = {};
+            document.cookie.split(';').forEach(function (el) {
+                let cookiekv = el.split('=');
+                cookie[cookiekv[0].trim()] = cookiekv[1];
+            })
+            if (cookie.hasOwnProperty(name)) {
+                return cookie[name];
+            }
+            return "";
+        };
+        var checkCookie = function () {
+            var token = "11159777566561619683";
+            var seed = getCookie('citrix_ns_seed');
+            var currentCookie = document.cookie;
+            if (currentCookie != lastCookie || (lastCookie.length == 0)) {
+                console.log('cookie has changed');
+                var hash = HMAC_SHA256_MAC(seed, token);
+                document.cookie = 'MC=' + hash + '; Domain= .dgii.gov.do';
+                lastCookie = currentCookie;
+                window.name = currentCookie;
+            }
+            return true;
+        };
+        window.setInterval(checkCookie, 100);
+    </script>
+
+
+    <style type="text/css">
+        .dl-horizontal dt {
+            width: auto !important;
+            text-align: left !important;
+        }
+
+        table tr th {
+            font-weight: bold;
+            width: 20%;
+        }
+
+        .logo {
+            width: 130%;
+        }
+
+        .header {
+            padding: 7px 0 0 2%;
+            color: rgb(125, 125, 125);
+        }
+
+        .table-container {
+            color: rgb(125, 125, 125);
+            margin: 1% 0 0 0;
+        }
+
+        @media screen and (max-width: 360px) {
+            .logo {
+                width: 100px !important;
+            }
+
+            .header {
+                padding: 4px 0 0 30% !important;
+            }
+
+            .table-container {
+                margin: 3% 0 0 0;
+            }
+        }
+
+        @media screen and (max-width: 768px) {
+            .logo {
+                width: 350%;
+            }
+
+            table tr th {
+                width: 60%;
+            }
+
+            .header {
+                padding: 11px 0 0 11%;
+            }
+
+            .table-container {
+                margin: 1.5% 0 0 0;
+            }
+        }
+    </style>
+
+    <div class="col-xs-12" style="padding:1% 0 0 0;">
+        <div class="col-xs-12">
+            <img src="/eCF/ConsultaTimbre/images/logo_dgii.svg" width="10%">
+        </div>
+        <div class="col-xs-12">
+            <h4><strong>Verificación e-NCF</strong></h4>
+        </div>
+    </div>
+
+    <div class="col-xs-12 table-container">
+        <table class="table table-striped">
+            <tbody>
+                <tr>
+                    <th class="text-left">RNC Emisor</th>
+                    <td>101019921</td>
+                </tr>
+                <tr>
+                    <th class="text-left">Razón social emisor</th>
+                    <td>CENTRO CUESTA NACIONAL</td>
+                </tr>
+                <tr>
+                    <th class="text-left">RNC Comprador</th>
+                    <td>130667632</td>
+                </tr>
+                <tr>
+                    <th class="text-left">Razón social comprador</th>
+                    <td>
+                        RACELAND S R L
+                    </td>
+                </tr>
+                <tr>
+                    <th>e-NCF</th>
+                    <td>E310007155277</td>
+                </tr>
+                <tr>
+                    <th>Fecha de Emisión</th>
+                    <td>17-01-2026</td>
+                </tr>
+                <tr>
+                    <th>
+                        Total de ITBIS
+                    </th>
+                    <td>
+                        839.41
+                    </td>
+                </tr>
+                <tr>
+                    <th>Monto Total</th>
+                    <td>6,938.58</td>
+                </tr>
+                <tr>
+                    <th>Estado</th>
+                    <td>Aceptado</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+
+
+    <script src="https://ajax.aspnetcdn.com/ajax/jquery/jquery-2.2.0.min.js" crossorigin="anonymous"
+        integrity="sha384-K+ctZQ+LL8q6tP7I94W+qzQsfRV2a+AfHIi9k8z8l9ggpc8X+Ytst4yBo/hH+8Fk">
+        </script>
+    <script>(window.jQuery || document.write("\u003Cscript src=\u0022/eCF/ConsultaTimbre/lib/jquery/dist/jquery.min.js\u0022 crossorigin=\u0022anonymous\u0022 integrity=\u0022sha384-K\u002BctZQ\u002BLL8q6tP7I94W\u002BqzQsfRV2a\u002BAfHIi9k8z8l9ggpc8X\u002BYtst4yBo/hH\u002B8Fk\u0022\u003E\u003C/script\u003E"));</script>
+    <script src="/eCF/ConsultaTimbre/lib/jquery/dist/jquery.min.js" crossorigin="anonymous"
+        integrity="sha384-K+ctZQ+LL8q6tP7I94W+qzQsfRV2a+AfHIi9k8z8l9ggpc8X+Ytst4yBo/hH+8Fk"></script>
+    <script src="https://ajax.aspnetcdn.com/ajax/bootstrap/3.3.7/bootstrap.min.js" crossorigin="anonymous"
+        integrity="sha384-Tc5IQib027qvyjSMfHjOMaLkfuWVxZxUPnCJA7l2mCWNIpG9mGCD8wGNIcPD7Txa">
+        </script>
+    <script>(window.jQuery && window.jQuery.fn && window.jQuery.fn.modal || document.write("\u003Cscript src=\u0022/eCF/ConsultaTimbre/lib/bootstrap/dist/js/bootstrap.min.js\u0022 crossorigin=\u0022anonymous\u0022 integrity=\u0022sha384-Tc5IQib027qvyjSMfHjOMaLkfuWVxZxUPnCJA7l2mCWNIpG9mGCD8wGNIcPD7Txa\u0022\u003E\u003C/script\u003E"));</script>
+    <script src="/eCF/ConsultaTimbre/lib/bootstrap/dist/js/bootstrap.min.js" crossorigin="anonymous"
+        integrity="sha384-Tc5IQib027qvyjSMfHjOMaLkfuWVxZxUPnCJA7l2mCWNIpG9mGCD8wGNIcPD7Txa"></script>
+    <script src="/eCF/ConsultaTimbre/js/site.min.js?v=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"></script>
+
+
+
+
+
+</body>
+
+</html>

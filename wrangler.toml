@@ -1,0 +1,14 @@
+name = "dgii-purchase-tracker"
+main = "src/index.ts"
+compatibility_date = "2024-01-15"
+
+[triggers]
+crons = ["0 8 * * *"]
+
+[vars]
+# These are placeholders - set actual values via `wrangler secret put`
+# TELEGRAM_BOT_TOKEN = ""
+# TELEGRAM_WEBHOOK_SECRET = ""
+# GOOGLE_SERVICE_ACCOUNT_EMAIL = ""
+# GOOGLE_PRIVATE_KEY = ""
+# SPREADSHEET_FOLDER_ID = ""
