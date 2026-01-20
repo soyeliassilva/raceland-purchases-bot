@@ -14,6 +14,19 @@ function createTimeoutSignal(ms: number): AbortSignal {
 }
 
 /**
+ * Case-insensitive URLSearchParams getter
+ */
+function getParamCaseInsensitive(params: URLSearchParams, key: string): string | null {
+  const lowerKey = key.toLowerCase();
+  for (const [k, v] of params.entries()) {
+    if (k.toLowerCase() === lowerKey) {
+      return v;
+    }
+  }
+  return null;
+}
+
+/**
  * Parse DGII confirmation URL and extract parameters
  */
 export function parseUrl(url: string): DgiiUrlParams | null {
@@ -25,13 +38,13 @@ export function parseUrl(url: string): DgiiUrlParams | null {
     const parsed = new URL(url);
     const params = parsed.searchParams;
 
-    const rncEmisor = params.get('RncEmisor');
-    const rncComprador = params.get('RncComprador');
-    const encf = params.get('ENCF');
-    const fechaEmision = params.get('FechaEmision');
-    const montoTotal = params.get('MontoTotal');
-    const fechaFirma = params.get('FechaFirma');
-    const codigoSeguridad = params.get('CodigoSeguridad');
+    const rncEmisor = getParamCaseInsensitive(params, 'RncEmisor');
+    const rncComprador = getParamCaseInsensitive(params, 'RncComprador');
+    const encf = getParamCaseInsensitive(params, 'ENCF');
+    const fechaEmision = getParamCaseInsensitive(params, 'FechaEmision');
+    const montoTotal = getParamCaseInsensitive(params, 'MontoTotal');
+    const fechaFirma = getParamCaseInsensitive(params, 'FechaFirma');
+    const codigoSeguridad = getParamCaseInsensitive(params, 'CodigoSeguridad');
 
     // All required params must be present
     if (!rncEmisor || !rncComprador || !encf || !fechaEmision || !montoTotal || !fechaFirma || !codigoSeguridad) {
