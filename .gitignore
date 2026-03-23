@@ -4,3 +4,8 @@ node_modules/
 *.log
 .env
 .dev.vars
+
+.codex
+.claude
+_bmad
+_bmad-output
