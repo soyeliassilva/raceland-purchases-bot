@@ -153,7 +153,7 @@ function extractTableValue(html: string, labelPatterns: string[]): string | null
 /**
  * Parse number handling both US (1,234.56) and Latin (1.234,56) formats
  */
-function parseNumber(str: string): number {
+export function parseNumber(str: string): number {
   // Remove whitespace
   const cleaned = str.trim();
 
