@@ -24,17 +24,21 @@ export interface DgiiScrapedData {
  * Complete invoice data combining URL params and scraped data
  */
 export interface Invoice {
-  // From URL
+  // From URL or photo OCR
   rncEmisor: string;
+  rncComprador?: string; // Buyer RNC (for photo invoices)
   encf: string;
   fechaEmision: Date;
   montoTotal: number;
-  codigoSeguridad: string;
+  codigoSeguridad: string | null; // null for photo invoices
   // From scrape (optional - may be null if scrape fails)
   vendorName: string | null;
   itbis: number | null;
   status: string; // "Aceptado" or "Pendiente ITBIS"
-  // Original URL for reference
+  // Source tracking
+  source: 'url' | 'photo';
+  invoiceType?: 'electronica' | 'papel'; // Auto-detected from ENCF vs NCF format
+  // Original URL for reference (empty for photos)
   originalUrl: string;
 }
 
@@ -56,6 +60,51 @@ export interface SheetRow {
 }
 
 /**
+ * OCR-extracted invoice data (before user confirmation)
+ * All fields are optional to handle partial extraction
+ */
+export interface ExtractedInvoiceData {
+  rncEmisor?: string;
+  rncComprador?: string;
+  ncf?: string;
+  fechaEmision?: string;
+  itbis?: number;
+  montoTotal?: number;
+}
+
+/**
+ * Cloudflare Workers AI binding type
+ */
+export type Ai = AiTextGeneration & AiImageClassification;
+
+export interface AiTextGeneration {
+  run(model: string, input: string | AiInput): Promise<AiResponse>;
+}
+
+export interface AiImageClassification {
+  run(model: string, input: AiImageInput): Promise<AiResponse>;
+}
+
+export type AiInput =
+  | string
+  | {
+      text?: string;
+      image?: Array<{ image: string }>;
+    };
+
+export type AiImageInput = {
+  image: Array<{ image: string }>;
+  text?: string;
+};
+
+export interface AiResponse {
+  success: boolean;
+  data?: {
+    response?: string;
+  };
+}
+
+/**
  * Cloudflare Worker environment bindings
  */
 export interface Env {
@@ -65,6 +114,8 @@ export interface Env {
   GOOGLE_PRIVATE_KEY: string;
   SPREADSHEET_FOLDER_ID?: string;
   ALLOWED_CHAT_IDS?: string; // Comma-separated list of allowed chat IDs
+  BUYER_RNC?: string; // Hardcoded buyer RNC for validation (photo invoices)
+  AI: Ai; // Cloudflare Workers AI binding
 }
 
 /**

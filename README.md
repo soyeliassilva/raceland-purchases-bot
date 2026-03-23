@@ -4,11 +4,15 @@ Telegram bot that tracks Dominican Republic DGII invoice confirmations and store
 
 ## Features
 
-- Monitors Telegram chat for DGII confirmation URLs (`ecf.dgii.gov.do`)
+- **URL-based tracking**: Monitors Telegram chat for DGII confirmation URLs (`ecf.dgii.gov.do`)
+- **Photo upload support**: Send receipt photos directly in chat, OCR extracts invoice data
 - Extracts invoice data from URL parameters and page scraping
+- OCR extraction using Cloudflare Workers AI for paper receipts
 - Stores invoices in Google Sheets organized by year/month
+- Uploads receipt photos to Google Drive (`Facturas/{YYYY}/{month}/`)
 - Automatic retry for invoices not yet available (up to 7 days)
-- Duplicate detection by ENCF number
+- Duplicate detection by ENCF number (and seller RNC for photos)
+- User confirmation dialog with editable fields for photo uploads
 
 ## Setup
 
@@ -89,6 +93,8 @@ curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
 
 ## Usage
 
+### URL Method (Electronic Invoices)
+
 1. Add the bot to your Telegram group/chat
 2. Share DGII confirmation URLs (e.g., `https://ecf.dgii.gov.do/...`)
 3. Bot will:
@@ -96,8 +102,31 @@ curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
    - Add to Google Sheets (auto-creates year spreadsheet and month sheet)
    - Reply with confirmation or queue for retry if not yet available
 
-## Google Sheets Structure
+### Photo Method (Paper Receipts)
 
+1. Send a clear photo of the receipt directly in the chat
+2. Bot will:
+   - Use OCR to extract invoice data (seller RNC, buyer RNC, NCF/ENCF, date, ITBIS, total)
+   - Present a confirmation dialog with extracted data
+   - Allow you to edit any field before confirming
+   - Upload the original photo to Google Drive
+   - Add the invoice to Google Sheets with a link to the photo
+
+3. Use the inline buttons to:
+   - Edit individual fields (RNC Emisor, NCF/ENCF, Fecha, ITBIS, Total)
+   - Confirm and save (✅ Todo Correcto)
+   - Cancel the operation (❌ Cancelar)
+
+### Notes
+
+- **Electronic invoices** (ENCF) and **paper receipts** (NCF) are both supported
+- For photo uploads, ensure all text is clearly visible and well-lit
+- The bot validates buyer RNC if `BUYER_RNC` is configured
+- Duplicate invoices are rejected with a notification message
+
+## Google Sheets & Drive Structure
+
+### Google Sheets
 ```
 Drive Root/
 └── Purchases-2026/
@@ -108,7 +137,23 @@ Drive Root/
 ```
 
 Each month sheet has columns:
-Date | ENCF | Vendor RNC | Vendor Name | Buyer RNC | Buyer Name | ITBIS | Total | Status | Security Code | Added By | Added At
+Date | Status | ENCF | Vendor RNC | Vendor Name | ITBIS | Total | URL | Added By | Added At
+
+### Google Drive (Photos)
+```
+Drive Root/
+└── Facturas/
+    └── 2026/
+        ├── Enero/
+        │   ├── E310007157932.jpg
+        │   └── A0100100100.jpg
+        ├── Febrero/
+        └── ...
+```
+
+- Photo uploads are stored with filename `{NCF or ENCF}.jpg`
+- The URL column contains the Drive link for photos, or DGII link for URL invoices
+- Security Code column is empty for photo-based invoices
 
 ## Development
 
@@ -132,3 +177,5 @@ npm test
 | `GOOGLE_SERVICE_ACCOUNT_EMAIL` | Service account email |
 | `GOOGLE_PRIVATE_KEY` | Service account private key (PEM format) |
 | `SPREADSHEET_FOLDER_ID` | Optional: Drive folder ID for spreadsheets |
+| `BUYER_RNC` | Optional: Hardcoded buyer RNC for validation (photo uploads) |
+| `ALLOWED_CHAT_IDS` | Optional: Comma-separated list of allowed chat IDs |

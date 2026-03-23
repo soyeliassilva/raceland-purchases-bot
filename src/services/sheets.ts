@@ -318,6 +318,47 @@ export async function isDuplicate(
 }
 
 /**
+ * Check if (seller RNC + ENCF) combination already exists in the month sheet
+ * Checks both column D (RNC Vendedor) and column C (ENCF)
+ */
+export async function isDuplicateWithRnc(
+  spreadsheetId: string,
+  sheetName: string,
+  rncEmisor: string,
+  encf: string,
+  accessToken: string
+): Promise<boolean> {
+  // Get both columns C (ENCF) and D (RNC Vendedor)
+  const response = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!C:D`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
+    }
+  );
+
+  if (!response.ok) {
+    // If sheet doesn't exist yet, not a duplicate
+    if (response.status === 400) {
+      return false;
+    }
+    throw new Error(`Duplicate check failed: ${response.status}`);
+  }
+
+  const data = await response.json() as { values?: string[][] };
+  if (!data.values) {
+    return false;
+  }
+
+  // Check if any row has matching RNC Emisor AND ENCF
+  return data.values.some((row) => {
+    const rowEncf = row[0]; // Column C
+    const rowRnc = row[1]; // Column D
+    return rowEncf === encf && rowRnc === rncEmisor;
+  });
+}
+
+/**
  * Append row to specified sheet
  */
 export async function appendRow(
@@ -411,7 +452,8 @@ export async function lookupVendorName(vendorRnc: string): Promise<string | null
 export async function addInvoiceToSheet(
   invoice: Invoice,
   username: string,
-  env: Env
+  env: Env,
+  driveUrl?: string
 ): Promise<'success' | 'duplicate'> {
   const accessToken = await getAccessToken(
     env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
@@ -431,9 +473,15 @@ export async function addInvoiceToSheet(
   // Get or create month sheet
   const sheetName = await getOrCreateSheet(spreadsheetId, monthIndex, accessToken);
 
-  // Check for duplicate in the month sheet
-  if (await isDuplicate(spreadsheetId, sheetName, invoice.encf, accessToken)) {
-    return 'duplicate';
+  // Check for duplicate in the month sheet (use enhanced check for photo invoices)
+  if (invoice.source === 'photo') {
+    if (await isDuplicateWithRnc(spreadsheetId, sheetName, invoice.rncEmisor, invoice.encf, accessToken)) {
+      return 'duplicate';
+    }
+  } else {
+    if (await isDuplicate(spreadsheetId, sheetName, invoice.encf, accessToken)) {
+      return 'duplicate';
+    }
   }
 
   // Look up vendor name from DGII if not already available
@@ -451,7 +499,7 @@ export async function addInvoiceToSheet(
     vendorName: vendorName || invoice.rncEmisor, // Fallback to RNC if no name
     itbis: invoice.itbis !== null ? invoice.itbis.toFixed(2) : '',
     total: invoice.montoTotal.toFixed(2),
-    url: invoice.originalUrl,
+    url: driveUrl || invoice.originalUrl, // Use Drive URL for photos, DGII URL for URLs
     addedBy: username,
     addedAt: new Date().toISOString(),
   };
