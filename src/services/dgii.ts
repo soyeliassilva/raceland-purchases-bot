@@ -71,10 +71,10 @@ export function parseUrl(url: string): DgiiUrlParams | null {
  * Returns null if format is invalid
  */
 export function parseDgiiDate(dateStr: string): Date | null {
-  // Validate format: dd-mm-yyyy
-  const match = dateStr.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  // Validate format: dd-mm-yyyy or dd/mm/yyyy
+  const match = dateStr.match(/^(\d{2})[-/](\d{2})[-/](\d{4})$/);
   if (!match) {
-    console.error(`Invalid date format: ${dateStr}, expected dd-mm-yyyy`);
+    console.error(`Invalid date format: ${dateStr}, expected dd-mm-yyyy or dd/mm/yyyy`);
     return null;
   }
 
@@ -236,6 +236,91 @@ export async function scrapePage(url: string): Promise<DgiiScrapedData | null> {
 }
 
 const DGII_FORM_URL = 'https://dgii.gov.do/app/WebApps/ConsultasWeb2/ConsultasWeb/consultas/ncf.aspx';
+const DGII_RNC_FORM_URL = 'https://dgii.gov.do/app/WebApps/ConsultasWeb2/ConsultasWeb/consultas/rnc.aspx';
+
+/**
+ * Look up seller name by RNC via DGII's RNC consulta form
+ */
+export async function lookupRncName(rnc: string): Promise<string | null> {
+  try {
+    console.log(`Looking up RNC: ${rnc}`);
+
+    // Step 1: GET the form page to extract ASP.NET hidden fields
+    const getResponse = await fetch(DGII_RNC_FORM_URL, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
+    });
+
+    if (!getResponse.ok) {
+      console.error(`RNC form GET failed: ${getResponse.status}`);
+      return null;
+    }
+
+    const formHtml = await getResponse.text();
+    const aspNetFields = extractAspNetFields(formHtml);
+
+    if (!aspNetFields.__VIEWSTATE) {
+      console.error('Could not extract __VIEWSTATE from RNC form');
+      return null;
+    }
+
+    // Step 2: POST the form using __EVENTTARGET (buttons are type="button" with __doPostBack)
+    const formData = new URLSearchParams();
+    formData.append('__EVENTTARGET', 'ctl00$cphMain$btnBuscarPorRNC');
+    formData.append('__EVENTARGUMENT', '');
+    formData.append('__VIEWSTATE', aspNetFields.__VIEWSTATE);
+    if (aspNetFields.__VIEWSTATEGENERATOR) {
+      formData.append('__VIEWSTATEGENERATOR', aspNetFields.__VIEWSTATEGENERATOR);
+    }
+    if (aspNetFields.__EVENTVALIDATION) {
+      formData.append('__EVENTVALIDATION', aspNetFields.__EVENTVALIDATION);
+    }
+    formData.append('ctl00$cphMain$txtRNCCedula', rnc);
+    formData.append('ctl00$cphMain$hidActiveTab', '#rnc');
+
+    const postResponse = await fetch(DGII_RNC_FORM_URL, {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      body: formData.toString(),
+      signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
+    });
+
+    if (!postResponse.ok) {
+      console.error(`RNC form POST failed: ${postResponse.status}`);
+      return null;
+    }
+
+    const resultHtml = await postResponse.text();
+
+    // The RNC form uses <td>Label</td><td>Value</td> pairs (not <th>/<td>)
+    const decodedResult = decodeHtmlEntities(resultHtml);
+    let name: string | null = null;
+    for (const label of ['Nombre/Razón Social', 'Nombre\\/Raz[oó]n Social', 'Razón Social', 'Nombre Comercial']) {
+      const pattern = new RegExp(
+        `<td[^>]*>\\s*${label}\\s*</td>\\s*<td[^>]*>\\s*([\\s\\S]*?)\\s*</td>`,
+        'i'
+      );
+      const match = decodedResult.match(pattern);
+      if (match && match[1]?.trim()) {
+        name = match[1].trim();
+        break;
+      }
+    }
+
+    console.log(`RNC lookup result for ${rnc}: ${name || 'not found'}`);
+    return name || null;
+  } catch (error) {
+    console.error('Error looking up RNC:', error);
+    return null;
+  }
+}
 
 /**
  * Extract ASP.NET hidden fields from HTML
@@ -408,6 +493,7 @@ export async function fetchInvoice(
       vendorName: null,
       itbis: null,
       status: 'Pendiente ITBIS',
+      source: 'url',
       originalUrl: url,
     };
   }
@@ -421,6 +507,7 @@ export async function fetchInvoice(
     vendorName: scraped.vendorName || null,
     itbis: parseNumber(scraped.itbis),
     status: scraped.status,
+    source: 'url',
     originalUrl: url,
   };
 }

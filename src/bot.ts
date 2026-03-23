@@ -1,7 +1,7 @@
 import { Bot, Context, webhookCallback } from 'grammy';
 import type { Env, Invoice, ExtractedInvoiceData } from './types.js';
 import { MONTH_NAMES } from './types.js';
-import { extractDgiiUrl, fetchInvoice, parseNumber } from './services/dgii.js';
+import { extractDgiiUrl, fetchInvoice, parseNumber, lookupRncName } from './services/dgii.js';
 import { addInvoiceToSheet, getAccessToken } from './services/sheets.js';
 import { extractInvoiceData, parseReceiptDate } from './services/ocr.js';
 import { getOrCreateReceiptFolder, uploadReceiptImage } from './services/drive.js';
@@ -36,7 +36,7 @@ function getUsername(ctx: Context): string {
  * Escape special characters for Markdown
  */
 export function escapeMarkdown(text: string): string {
-  return text.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+  return text.replace(/[-_*[\]()~`>#+=|{}!.]/g, '\\$&');
 }
 
 /**
@@ -99,27 +99,40 @@ function formatConfirmationMessage(data: ExtractedInvoiceData): string {
   ];
 
   if (data.rncEmisor) {
-    lines.push(`🏢 RNC Emisor: \`${escapeMarkdown(data.rncEmisor)}\``);
+    lines.push(`🏢 RNC Emisor: \`${data.rncEmisor}\``);
+  } else {
+    lines.push('⚠️ RNC Emisor: _No detectado \\- usa \\[1\\] para ingresarlo_');
+  }
+  if (data.vendorName) {
+    lines.push(`🏪 Vendedor: ${escapeMarkdown(data.vendorName)}`);
   }
   if (data.rncComprador) {
-    lines.push(`🛒 RNC Comprador: \`${escapeMarkdown(data.rncComprador)}\``);
+    lines.push(`🛒 RNC Comprador: \`${data.rncComprador}\``);
   }
   if (data.ncf) {
-    lines.push(`📄 NCF/ENCF: \`${escapeMarkdown(data.ncf)}\``);
+    lines.push(`📄 NCF/ENCF: \`${data.ncf}\``);
   }
   if (data.fechaEmision) {
-    lines.push(`📅 Fecha: \`${escapeMarkdown(data.fechaEmision)}\``);
+    lines.push(`📅 Fecha: \`${data.fechaEmision}\``);
   }
   if (data.itbis !== undefined) {
-    lines.push(`📊 ITBIS: RD\\$\`${escapeMarkdown(data.itbis.toFixed(2))}\``);
+    const itbisStr = data.itbis.toFixed(2);
+    const escapedItbis = escapeMarkdown(itbisStr);
+    console.log(`ITBIS DEBUG: original="${itbisStr}" escaped="${escapedItbis}"`);
+    lines.push(`📊 ITBIS: RD\\$${escapedItbis}`);
   }
   if (data.montoTotal !== undefined) {
-    lines.push(`💰 Total: RD\\$\`${escapeMarkdown(data.montoTotal.toFixed(2))}\``);
+    const totalStr = data.montoTotal.toFixed(2);
+    const escapedTotal = escapeMarkdown(totalStr);
+    console.log(`TOTAL DEBUG: original="${totalStr}" escaped="${escapedTotal}"`);
+    lines.push(`💰 Total: RD\\$${escapedTotal}`);
   }
 
   lines.push('', 'Por favor, verifica los datos\\. Puedes editar un campo seleccionando el número correspondiente\\.');
 
-  return lines.join('\n');
+  const result = lines.join('\n');
+  console.log('FULL MESSAGE DEBUG:', result);
+  return result;
 }
 
 /**
@@ -143,15 +156,15 @@ function validateFieldInput(fieldIndex: number, value: string): { valid: boolean
   const trimmed = value.trim();
 
   switch (fieldIndex) {
-    case 1: // RNC Emisor
-      if (/^\d{9}$/.test(trimmed)) {
+    case 1: // RNC Emisor (9 digits) or Cédula (11 digits)
+      if (/^\d{9}$/.test(trimmed) || /^\d{11}$/.test(trimmed)) {
         return { valid: true, parsedValue: trimmed };
       }
       return { valid: false };
 
     case 2: // NCF/ENCF
       const upperNcf = trimmed.toUpperCase();
-      if (/^[A-Z]\d{10}$/.test(upperNcf) || /^E\d{11}$/.test(upperNcf)) {
+      if (/^[A-Z]\d{3,31}$/.test(upperNcf)) {
         return { valid: true, parsedValue: upperNcf };
       }
       return { valid: false };
@@ -203,7 +216,7 @@ async function handlePhotoUpload(ctx: Context, env: Env): Promise<void> {
     cleanupExpiredStates();
 
     // Get the highest resolution photo
-    const photos = ctx.message.photo;
+    const photos = ctx.message?.photo;
     if (!photos || photos.length === 0) {
       await ctx.reply('❌ No se pudo obtener la foto\\. Por favor intenta de nuevo\\.', { parse_mode: 'MarkdownV2' });
       return;
@@ -221,9 +234,9 @@ async function handlePhotoUpload(ctx: Context, env: Env): Promise<void> {
     const photoBuffer = await photoResponse.arrayBuffer();
 
     // Extract invoice data using OCR
-    await ctx.reply('🔍 Analizando la factura\\. Esto puede tomar unos segundos...\\.\\.\\.', { parse_mode: 'MarkdownV2' });
+    await ctx.reply('🔍 Analizando la factura\\. Esto puede tomar unos segundos\\.\\.\\.\\.', { parse_mode: 'MarkdownV2' });
 
-    const extractedData = await extractInvoiceData(photoBuffer, env.AI);
+    const extractedData = await extractInvoiceData(photoBuffer, env.AI, env.BUYER_RNC);
 
     if (!extractedData) {
       await ctx.reply(
@@ -241,6 +254,14 @@ async function handlePhotoUpload(ctx: Context, env: Env): Promise<void> {
           { parse_mode: 'MarkdownV2' }
         );
         return;
+      }
+    }
+
+    // Look up vendor name from RNC
+    if (extractedData.rncEmisor) {
+      const vendorName = await lookupRncName(extractedData.rncEmisor);
+      if (vendorName) {
+        extractedData.vendorName = vendorName;
       }
     }
 
@@ -272,12 +293,22 @@ async function handlePhotoUpload(ctx: Context, env: Env): Promise<void> {
       ],
     };
 
-    await ctx.reply(formatConfirmationMessage(extractedData), {
+    const message = formatConfirmationMessage(extractedData);
+    console.log('=== ABOUT TO SEND MESSAGE ===');
+    console.log('Message text:', message);
+    console.log('Message length:', message.length);
+    console.log('============================');
+
+    await ctx.reply(message, {
       parse_mode: 'MarkdownV2',
       reply_markup: keyboard,
     });
   } catch (error) {
-    console.error('Error handling photo upload:', error);
+    const errorMsg = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+    console.error('Error handling photo upload:', errorMsg);
+    if (error instanceof Error && error.stack) {
+      console.error('Stack:', error.stack);
+    }
     await ctx.reply('❌ Ocurrió un error al procesar la foto\\. Por favor intenta de nuevo\\.', { parse_mode: 'MarkdownV2' });
     conversationState.delete(chatId);
   }
@@ -293,7 +324,7 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
   const { data, photoBuffer } = state;
 
   try {
-    await ctx.reply('💾 Guardando la factura...\\.\\.\\.', { parse_mode: 'MarkdownV2' });
+    await ctx.reply('💾 Guardando la factura\\.\\.\\.', { parse_mode: 'MarkdownV2' });
 
     const accessToken = await getAccessToken(
       env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
@@ -309,7 +340,7 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
     // Upload to Drive
     const year = fechaEmision.getUTCFullYear();
     const monthIndex = fechaEmision.getUTCMonth();
-    const monthFolderId = await getOrCreateReceiptFolder(year, monthIndex, accessToken);
+    const monthFolderId = await getOrCreateReceiptFolder(year, monthIndex, accessToken, env.SHARED_FOLDER_ID);
 
     const filename = `${data.ncf || 'factura'}.jpg`;
     const { webViewLink } = await uploadReceiptImage(photoBuffer, filename, monthFolderId, accessToken);
@@ -322,7 +353,7 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
       fechaEmision,
       montoTotal: data.montoTotal || 0,
       codigoSeguridad: null, // Photos don't have security codes
-      vendorName: null, // Will be looked up
+      vendorName: data.vendorName || null,
       itbis: data.itbis || null,
       status: 'Aceptado',
       source: 'photo',
@@ -345,7 +376,7 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
           '✅ *Factura Agregada*',
           '',
           `📄 NCF/ENCF: \`${invoice.encf}\``,
-          `🏢 Vendedor: \`${escapeMarkdown(invoice.rncEmisor)}\``,
+          `🏢 Vendedor: \`${invoice.rncEmisor}\``,
           `💰 Total: RD\\$${total}`,
           `📊 ITBIS: RD\\$${itbis}`,
           '',
@@ -508,7 +539,7 @@ function getBot(env: Env): Bot {
     }
 
     // Check for DGII URL
-    const url = extractDgiiUrl(text || '');
+    const url = extractDgiiUrl(ctx.message.text || '');
 
     if (url) {
       try {

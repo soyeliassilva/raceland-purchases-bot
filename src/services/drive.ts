@@ -169,7 +169,7 @@ export async function uploadReceiptImage(
   }
 
   const response = await fetch(
-    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true',
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,webViewLink',
     {
       method: 'POST',
       headers: {

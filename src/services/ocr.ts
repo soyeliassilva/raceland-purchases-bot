@@ -1,5 +1,4 @@
 import type { ExtractedInvoiceData, Ai } from '../types.js';
-import { FETCH_TIMEOUT_MS } from '../types.js';
 
 const MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct';
 
@@ -13,10 +12,10 @@ function createTimeoutSignal(ms: number): AbortSignal {
 }
 
 /**
- * Validate RNC format (9 digits)
+ * Validate RNC (9 digits) or Cédula (11 digits) format
  */
 function isValidRnc(rnc: string): boolean {
-  return /^\d{9}$/.test(rnc.trim());
+  return /^\d{9}$/.test(rnc.trim()) || /^\d{11}$/.test(rnc.trim());
 }
 
 /**
@@ -26,15 +25,8 @@ function isValidRnc(rnc: string): boolean {
  */
 function isValidNcfOrEncf(value: string): boolean {
   const trimmed = value.trim().toUpperCase();
-  // NCF format: 1 letter + 10 digits
-  if (/^[A-Z]\d{10}$/.test(trimmed)) {
-    return true;
-  }
-  // ENCF format: E + 11 digits
-  if (/^E\d{11}$/.test(trimmed)) {
-    return true;
-  }
-  return false;
+  // NCF/ENCF: starts with a letter, followed by digits, 4-32 chars total
+  return /^[A-Z]\d{3,31}$/.test(trimmed);
 }
 
 /**
@@ -113,67 +105,96 @@ function parseNumber(str: string): number {
  */
 export async function extractInvoiceData(
   imageBuffer: ArrayBuffer,
-  ai: Ai
+  ai: Ai,
+  buyerRnc?: string
 ): Promise<ExtractedInvoiceData | null> {
   try {
     console.log('Starting OCR extraction...');
 
     // Convert ArrayBuffer to base64
     const bytes = new Uint8Array(imageBuffer);
+    console.log(`Image size: ${bytes.byteLength} bytes`);
     let binary = '';
     for (let i = 0; i < bytes.byteLength; i++) {
       binary += String.fromCharCode(bytes[i]);
     }
     const base64Image = btoa(binary);
+    console.log(`Base64 image length: ${base64Image.length} chars`);
 
     // Create OCR prompt
-    const prompt = `Extract the following invoice data from this receipt image and return ONLY a JSON object (no markdown, no code blocks):
+    const prompt = `Extract the following invoice data from this Dominican Republic receipt/invoice image and return ONLY a JSON object (no markdown, no code blocks):
 {
-  "rncEmisor": "9-digit seller RNC",
-  "rncComprador": "9-digit buyer RNC",
-  "ncf": "NCF or ENCF number",
-  "fechaEmision": "date in DD-MM-YYYY format",
-  "itbis": "ITBIS amount as number",
+  "rncEmisor": "seller/vendor RNC (usually at the top of the receipt, labeled RNC or near the business name)",
+  "rncComprador": "buyer/client RNC (usually labeled RNC Comprador or Cliente)",
+  "ncf": "NCF or ENCF number (starts with a letter like E or B)",
+  "fechaEmision": "invoice date in DD-MM-YYYY format",
+  "itbis": "ITBIS tax amount as number",
   "montoTotal": "total amount as number"
 }
 
-If a field cannot be read, use null for its value.
-For the NCF/ENCF field, extract exactly as shown (ENCF starts with E, NCF starts with a letter).
-For dates, always use DD-MM-YYYY format.
-For amounts, use numbers only (no currency symbols).`;
+IMPORTANT:
+- The seller/vendor RNC (rncEmisor) is the business that issued the receipt. It appears at the TOP of the receipt near the business name/logo.
+- The buyer RNC (rncComprador) is the client who received the goods/services. It usually appears lower, labeled "RNC Comprador" or "Cliente".
+- RNC numbers may contain dashes (e.g., 101-71926-5). Remove all dashes and return digits only (e.g., 101719265).
+- If a field cannot be read, use null for its value.
+- For the NCF/ENCF field, extract exactly as shown (ENCF starts with E, NCF starts with a letter).
+- For dates, always use DD-MM-YYYY format.
+- For amounts, use numbers only (no currency symbols).`;
 
-    // Call Cloudflare Workers AI
+    // Call Cloudflare Workers AI with OpenAI-compatible messages format
     const response = await ai.run(MODEL, {
-      image: [{ image: base64Image }],
-      text: prompt,
-    } as unknown as Parameters<Ai['run']>[1]);
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: {
+                url: `data:image/jpeg;base64,${base64Image}`,
+              },
+            },
+            {
+              type: 'text',
+              text: prompt,
+            },
+          ],
+        },
+      ],
+    });
 
-    if (!response.success || !response.data?.response) {
-      console.error('OCR AI call failed');
+    console.log('AI response received:', JSON.stringify(response).substring(0, 500));
+
+    if (!response.response) {
+      console.error('OCR AI call failed - no response field:', JSON.stringify(response));
       return null;
     }
 
-    let jsonText = response.data.response.trim();
-
-    // Remove markdown code blocks if present
-    jsonText = jsonText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
-
-    console.log('OCR raw response:', jsonText);
-
-    // Parse JSON response
-    const extracted = JSON.parse(jsonText) as ExtractedInvoiceData;
+    // response.response can be a string or an already-parsed object
+    let extracted: ExtractedInvoiceData;
+    if (typeof response.response === 'string') {
+      let jsonText = response.response.trim();
+      // Remove markdown code blocks if present
+      jsonText = jsonText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+      console.log('OCR raw response (string):', jsonText);
+      extracted = JSON.parse(jsonText) as ExtractedInvoiceData;
+    } else {
+      console.log('OCR raw response (object):', JSON.stringify(response.response));
+      extracted = response.response as unknown as ExtractedInvoiceData;
+    }
 
     // Validate and normalize extracted data
     const result: ExtractedInvoiceData = {};
 
-    // Validate RNC Emisor (critical field)
-    if (extracted.rncEmisor && isValidRnc(extracted.rncEmisor)) {
-      result.rncEmisor = extracted.rncEmisor.trim();
+    // Validate RNC Emisor (critical field) - strip dashes first
+    const cleanRncEmisor = extracted.rncEmisor?.replace(/-/g, '').trim();
+    if (cleanRncEmisor && isValidRnc(cleanRncEmisor)) {
+      result.rncEmisor = cleanRncEmisor;
     }
 
-    // Validate RNC Comprador (optional but good to have)
-    if (extracted.rncComprador && isValidRnc(extracted.rncComprador)) {
-      result.rncComprador = extracted.rncComprador.trim();
+    // Validate RNC Comprador (optional but good to have) - strip dashes first
+    const cleanRncComprador = extracted.rncComprador?.replace(/-/g, '').trim();
+    if (cleanRncComprador && isValidRnc(cleanRncComprador)) {
+      result.rncComprador = cleanRncComprador;
     }
 
     // Validate NCF/ENCF (critical field)
@@ -211,14 +232,31 @@ For amounts, use numbers only (no currency symbols).`;
       }
     }
 
-    // Check if critical fields are present
-    if (!result.rncEmisor || !result.ncf || !result.montoTotal) {
+    // Fix swapped RNCs: if the "seller" RNC matches the known buyer, swap them
+    if (buyerRnc && result.rncEmisor === buyerRnc) {
+      console.log(`RNC swap: rncEmisor (${result.rncEmisor}) matches buyer RNC, swapping with rncComprador (${result.rncComprador || 'empty'})`);
+      const temp = result.rncEmisor;
+      result.rncEmisor = result.rncComprador;
+      result.rncComprador = temp;
+    }
+
+    // Also handle case where buyer RNC appears as neither field but seller is missing
+    if (buyerRnc && !result.rncComprador && result.rncEmisor !== buyerRnc) {
+      result.rncComprador = buyerRnc;
+    }
+
+    // Check if minimum fields are present (NCF and total are essential; RNC can be edited by user)
+    if (!result.ncf || !result.montoTotal) {
       console.error('OCR missing critical fields:', {
         hasRncEmisor: !!result.rncEmisor,
         hasNcf: !!result.ncf,
         hasTotal: !!result.montoTotal,
       });
       return null;
+    }
+
+    if (!result.rncEmisor) {
+      console.log('OCR: seller RNC missing, user will need to provide it');
     }
 
     console.log('OCR extraction successful:', result);

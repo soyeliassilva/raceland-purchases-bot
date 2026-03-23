@@ -70,38 +70,35 @@ export interface ExtractedInvoiceData {
   fechaEmision?: string;
   itbis?: number;
   montoTotal?: number;
+  vendorName?: string;
 }
 
 /**
  * Cloudflare Workers AI binding type
  */
-export type Ai = AiTextGeneration & AiImageClassification;
-
-export interface AiTextGeneration {
-  run(model: string, input: string | AiInput): Promise<AiResponse>;
+export interface Ai {
+  run(model: string, input: AiInput): Promise<AiResponse>;
 }
 
-export interface AiImageClassification {
-  run(model: string, input: AiImageInput): Promise<AiResponse>;
-}
-
-export type AiInput =
-  | string
-  | {
-      text?: string;
-      image?: Array<{ image: string }>;
-    };
-
-export type AiImageInput = {
-  image: Array<{ image: string }>;
+export interface AiMessageContentPart {
+  type: 'text' | 'image_url';
   text?: string;
-};
+  image_url?: { url: string };
+}
+
+export interface AiMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string | AiMessageContentPart[];
+}
+
+export interface AiInput {
+  messages: AiMessage[];
+  max_tokens?: number;
+  temperature?: number;
+}
 
 export interface AiResponse {
-  success: boolean;
-  data?: {
-    response?: string;
-  };
+  response?: string | Record<string, unknown>;
 }
 
 /**
@@ -113,6 +110,7 @@ export interface Env {
   GOOGLE_SERVICE_ACCOUNT_EMAIL: string;
   GOOGLE_PRIVATE_KEY: string;
   SPREADSHEET_FOLDER_ID?: string;
+  SHARED_FOLDER_ID?: string; // Google Drive shared folder ID for receipt uploads
   ALLOWED_CHAT_IDS?: string; // Comma-separated list of allowed chat IDs
   BUYER_RNC?: string; // Hardcoded buyer RNC for validation (photo invoices)
   AI: Ai; // Cloudflare Workers AI binding
