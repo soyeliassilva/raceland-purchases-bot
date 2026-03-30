@@ -197,9 +197,12 @@ IMPORTANT:
       result.rncComprador = cleanRncComprador;
     }
 
-    // Validate NCF/ENCF (critical field)
-    if (extracted.ncf && isValidNcfOrEncf(extracted.ncf)) {
-      result.ncf = extracted.ncf.trim().toUpperCase();
+    // Validate NCF/ENCF (critical field) - strip leading zeros before the letter
+    if (extracted.ncf) {
+      const cleanNcf = extracted.ncf.trim().toUpperCase().replace(/^0+/, '');
+      if (isValidNcfOrEncf(cleanNcf)) {
+        result.ncf = cleanNcf;
+      }
     }
 
     // Parse date

@@ -12,7 +12,7 @@ function createTimeoutSignal(ms: number): AbortSignal {
 /**
  * Search for a folder in Drive by name and parent
  */
-async function findFolder(
+export async function findFolder(
   name: string,
   accessToken: string,
   parentFolderId?: string
@@ -46,7 +46,7 @@ async function findFolder(
 /**
  * Create a folder in Drive
  */
-async function createFolder(
+export async function createFolder(
   name: string,
   accessToken: string,
   parentFolderId?: string
@@ -84,7 +84,25 @@ async function createFolder(
 }
 
 /**
- * Get or create the receipt folder structure: Facturas/{YYYY}/{month}/
+ * Get or create the year folder: {YYYY}/
+ * Shared by both receipt photos and spreadsheets
+ */
+export async function getOrCreateYearFolder(
+  year: number,
+  accessToken: string,
+  baseFolderId?: string
+): Promise<string> {
+  const yearStr = year.toString();
+  let yearFolderId = await findFolder(yearStr, accessToken, baseFolderId);
+  if (!yearFolderId) {
+    console.log(`Creating year folder: ${yearStr}`);
+    yearFolderId = await createFolder(yearStr, accessToken, baseFolderId);
+  }
+  return yearFolderId;
+}
+
+/**
+ * Get or create the receipt folder structure: {YYYY}/{month}/
  * Returns the month folder ID
  */
 export async function getOrCreateReceiptFolder(
@@ -95,22 +113,10 @@ export async function getOrCreateReceiptFolder(
 ): Promise<string> {
   const monthName = MONTH_NAMES[monthIndex];
 
-  // Find or create "Facturas" folder
-  let facturasFolderId = await findFolder('Facturas', accessToken, baseFolderId);
-  if (!facturasFolderId) {
-    console.log('Creating Facturas folder...');
-    facturasFolderId = await createFolder('Facturas', accessToken, baseFolderId);
-  }
-
   // Find or create year folder
-  const yearStr = year.toString();
-  let yearFolderId = await findFolder(yearStr, accessToken, facturasFolderId);
-  if (!yearFolderId) {
-    console.log(`Creating year folder: ${yearStr}`);
-    yearFolderId = await createFolder(yearStr, accessToken, facturasFolderId);
-  }
+  const yearFolderId = await getOrCreateYearFolder(year, accessToken, baseFolderId);
 
-  // Find or create month folder
+  // Find or create month folder directly inside year
   let monthFolderId = await findFolder(monthName, accessToken, yearFolderId);
   if (!monthFolderId) {
     console.log(`Creating month folder: ${monthName}`);

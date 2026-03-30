@@ -102,6 +102,15 @@ export interface AiResponse {
 }
 
 /**
+ * Per-tenant configuration for multi-company support
+ */
+export interface TenantConfig {
+  name: string; // Company name (e.g., "Raiceland", "AlmaLogic")
+  folderId?: string; // Google Drive folder ID (for both spreadsheets and receipt photos)
+  buyerRnc?: string; // Buyer RNC for validation (photo invoices)
+}
+
+/**
  * Cloudflare Worker environment bindings
  */
 export interface Env {
@@ -113,6 +122,7 @@ export interface Env {
   SHARED_FOLDER_ID?: string; // Google Drive shared folder ID for receipt uploads
   ALLOWED_CHAT_IDS?: string; // Comma-separated list of allowed chat IDs
   BUYER_RNC?: string; // Hardcoded buyer RNC for validation (photo invoices)
+  TENANTS_CONFIG?: string; // JSON mapping chat IDs to TenantConfig (multi-tenant mode)
   AI: Ai; // Cloudflare Workers AI binding
 }
 

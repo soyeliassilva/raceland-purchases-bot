@@ -1,5 +1,5 @@
 import { Bot, Context, webhookCallback } from 'grammy';
-import type { Env, Invoice, ExtractedInvoiceData } from './types.js';
+import type { Env, Invoice, ExtractedInvoiceData, TenantConfig } from './types.js';
 import { MONTH_NAMES } from './types.js';
 import { extractDgiiUrl, fetchInvoice, parseNumber, lookupRncName } from './services/dgii.js';
 import { addInvoiceToSheet, getAccessToken } from './services/sheets.js';
@@ -9,13 +9,60 @@ import { getOrCreateReceiptFolder, uploadReceiptImage } from './services/drive.j
 // Bot instance cache (reuse across requests within same Worker instance)
 let cachedBot: { bot: Bot; token: string } | null = null;
 
+// Parsed tenants config cache
+let cachedTenantsConfig: Map<string, TenantConfig> | null = null;
+
+/**
+ * Parse TENANTS_CONFIG JSON into a Map of chatId -> TenantConfig
+ */
+function getTenantsConfig(env: Env): Map<string, TenantConfig> | null {
+  if (!env.TENANTS_CONFIG) return null;
+  if (cachedTenantsConfig) return cachedTenantsConfig;
+
+  try {
+    const parsed = JSON.parse(env.TENANTS_CONFIG) as Record<string, TenantConfig>;
+    cachedTenantsConfig = new Map(Object.entries(parsed));
+    return cachedTenantsConfig;
+  } catch (error) {
+    console.error('Failed to parse TENANTS_CONFIG:', error);
+    return null;
+  }
+}
+
+/**
+ * Resolve tenant config for a given chat ID.
+ * In multi-tenant mode: returns tenant config or null if chat is not configured.
+ * In single-tenant mode: returns a config built from flat env vars.
+ */
+function resolveTenant(chatId: string, env: Env): TenantConfig | null {
+  const tenants = getTenantsConfig(env);
+
+  if (tenants) {
+    // Multi-tenant mode: look up by chat ID
+    return tenants.get(chatId) || null;
+  }
+
+  // Single-tenant mode: check ALLOWED_CHAT_IDS, then build config from env
+  if (env.ALLOWED_CHAT_IDS) {
+    const allowedIds = env.ALLOWED_CHAT_IDS.split(',').map((id) => id.trim());
+    if (!allowedIds.includes(chatId)) return null;
+  }
+
+  return {
+    name: 'Default',
+    folderId: env.SPREADSHEET_FOLDER_ID || env.SHARED_FOLDER_ID,
+    buyerRnc: env.BUYER_RNC,
+  };
+}
+
 // Conversation state for photo upload confirmation (persists within single Worker invocation)
-// Map<chatId, { data: ExtractedInvoiceData, timestamp: number, editingField?: string }>
+// Map<chatId, { data, timestamp, editingField?, photoBuffer, tenant }>
 const conversationState = new Map<string, {
   data: ExtractedInvoiceData;
   timestamp: number;
   editingField?: string;
   photoBuffer: ArrayBuffer;
+  tenant: TenantConfig;
 }>();
 
 // Session timeout (5 minutes)
@@ -101,7 +148,7 @@ function formatConfirmationMessage(data: ExtractedInvoiceData): string {
   if (data.rncEmisor) {
     lines.push(`🏢 RNC Emisor: \`${data.rncEmisor}\``);
   } else {
-    lines.push('⚠️ RNC Emisor: _No detectado \\- usa \\[1\\] para ingresarlo_');
+    lines.push('⚠️ RNC Emisor: _No detectado \\- usa Editar RNC para ingresarlo_');
   }
   if (data.vendorName) {
     lines.push(`🏪 Vendedor: ${escapeMarkdown(data.vendorName)}`);
@@ -140,11 +187,11 @@ function formatConfirmationMessage(data: ExtractedInvoiceData): string {
  */
 function getFieldLabel(fieldIndex: number): string {
   const labels = {
-    1: 'RNC Emisor',
-    2: 'NCF/ENCF',
+    1: 'RNC',
+    2: 'NCF',
     3: 'Fecha',
     4: 'ITBIS',
-    5: 'Monto Total',
+    5: 'Total',
   };
   return labels[fieldIndex as keyof typeof labels] || 'campo';
 }
@@ -207,7 +254,7 @@ function cleanupExpiredStates(): void {
 /**
  * Handle photo upload and OCR extraction
  */
-async function handlePhotoUpload(ctx: Context, env: Env): Promise<void> {
+async function handlePhotoUpload(ctx: Context, env: Env, tenant: TenantConfig): Promise<void> {
   const chatId = ctx.chat?.id?.toString();
   if (!chatId) return;
 
@@ -236,7 +283,7 @@ async function handlePhotoUpload(ctx: Context, env: Env): Promise<void> {
     // Extract invoice data using OCR
     await ctx.reply('🔍 Analizando la factura\\. Esto puede tomar unos segundos\\.\\.\\.\\.', { parse_mode: 'MarkdownV2' });
 
-    const extractedData = await extractInvoiceData(photoBuffer, env.AI, env.BUYER_RNC);
+    const extractedData = await extractInvoiceData(photoBuffer, env.AI, tenant.buyerRnc);
 
     if (!extractedData) {
       await ctx.reply(
@@ -246,9 +293,9 @@ async function handlePhotoUpload(ctx: Context, env: Env): Promise<void> {
       return;
     }
 
-    // Validate buyer RNC if BUYER_RNC is configured
-    if (env.BUYER_RNC && extractedData.rncComprador) {
-      if (extractedData.rncComprador !== env.BUYER_RNC) {
+    // Validate buyer RNC if configured for this tenant
+    if (tenant.buyerRnc && extractedData.rncComprador) {
+      if (extractedData.rncComprador !== tenant.buyerRnc) {
         await ctx.reply(
           '⚠️ El RNC del comprador no coincide con el valor configurado\\. Por favor asegúrate de que la factura pertenezca a tu empresa o usa el método de URL\\.',
           { parse_mode: 'MarkdownV2' }
@@ -265,26 +312,27 @@ async function handlePhotoUpload(ctx: Context, env: Env): Promise<void> {
       }
     }
 
-    // Store conversation state
+    // Store conversation state (including tenant for later use in confirmation)
     conversationState.set(chatId, {
       data: extractedData,
       timestamp: Date.now(),
       photoBuffer,
+      tenant,
     });
 
     // Build inline keyboard
     const keyboard = {
       inline_keyboard: [
         [
-          { text: '[1] Editar RNC Emisor', callback_data: 'edit:1' },
-          { text: '[2] Editar NCF/ENCF', callback_data: 'edit:2' },
+          { text: 'Editar RNC', callback_data: 'edit:1' },
+          { text: 'Editar NCF', callback_data: 'edit:2' },
         ],
         [
-          { text: '[3] Editar Fecha', callback_data: 'edit:3' },
-          { text: '[4] Editar ITBIS', callback_data: 'edit:4' },
+          { text: 'Editar Fecha', callback_data: 'edit:3' },
+          { text: 'Editar ITBIS', callback_data: 'edit:4' },
         ],
         [
-          { text: '[5] Editar Total', callback_data: 'edit:5' },
+          { text: 'Editar Total', callback_data: 'edit:5' },
         ],
         [
           { text: '✅ Todo Correcto', callback_data: 'confirm' },
@@ -321,7 +369,7 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
   const state = conversationState.get(chatId);
   if (!state) return;
 
-  const { data, photoBuffer } = state;
+  const { data, photoBuffer, tenant } = state;
 
   try {
     await ctx.reply('💾 Guardando la factura\\.\\.\\.', { parse_mode: 'MarkdownV2' });
@@ -337,12 +385,15 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
       throw new Error('Invalid invoice date');
     }
 
-    // Upload to Drive
+    // Upload to Drive (use tenant-specific folder)
     const year = fechaEmision.getUTCFullYear();
     const monthIndex = fechaEmision.getUTCMonth();
-    const monthFolderId = await getOrCreateReceiptFolder(year, monthIndex, accessToken, env.SHARED_FOLDER_ID);
+    const monthFolderId = await getOrCreateReceiptFolder(year, monthIndex, accessToken, tenant.folderId);
 
-    const filename = `${data.ncf || 'factura'}.jpg`;
+    // Format filename as DD-MM-YYYY - NCF {ncf}.jpg
+    const day = fechaEmision.getUTCDate().toString().padStart(2, '0');
+    const month = (fechaEmision.getUTCMonth() + 1).toString().padStart(2, '0');
+    const filename = `${day}-${month}-${year} - NCF ${data.ncf || 'desconocido'}.jpg`;
     const { webViewLink } = await uploadReceiptImage(photoBuffer, filename, monthFolderId, accessToken);
 
     // Create invoice object
@@ -362,7 +413,7 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
     };
 
     const username = ctx.from?.username ? `@${ctx.from.username}` : ctx.from?.first_name || `User ${ctx.from?.id}`;
-    const result = await addInvoiceToSheet(invoice, username, env, webViewLink);
+    const result = await addInvoiceToSheet(invoice, username, env, webViewLink, tenant.folderId);
 
     if (result === 'duplicate') {
       await ctx.reply(formatDuplicateMessage(invoice.encf), { parse_mode: 'MarkdownV2' });
@@ -399,7 +450,8 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
 async function handleDgiiUrl(
   ctx: Context,
   url: string,
-  env: Env
+  env: Env,
+  tenant: TenantConfig
 ): Promise<void> {
   const result = await fetchInvoice(url);
 
@@ -408,10 +460,23 @@ async function handleDgiiUrl(
     return;
   }
 
+  // Validate buyer RNC if configured for this tenant
+  if (tenant.buyerRnc && result.rncComprador && result.rncComprador !== tenant.buyerRnc) {
+    const buyerName = await lookupRncName(result.rncComprador);
+    const displayName = buyerName
+      ? `${escapeMarkdown(buyerName)} \\(\`${result.rncComprador}\`\\)`
+      : `\`${result.rncComprador}\``;
+    await ctx.reply(
+      `⚠️ Esta factura fue emitida a nombre de ${displayName}, no corresponde a este grupo\\.`,
+      { parse_mode: 'MarkdownV2' }
+    );
+    return;
+  }
+
   const username = getUsername(ctx);
 
   // Always add to sheet (even if ITBIS is pending)
-  const sheetResult = await addInvoiceToSheet(result, username, env);
+  const sheetResult = await addInvoiceToSheet(result, username, env, undefined, tenant.folderId);
 
   if (sheetResult === 'duplicate') {
     await ctx.reply(formatDuplicateMessage(result.encf), { parse_mode: 'MarkdownV2' });
@@ -442,16 +507,9 @@ function getBot(env: Env): Bot {
     const chatId = ctx.chat?.id?.toString();
     console.log(`Message received from chat: ${chatId}`);
 
-    // Check if chat is allowed (if restriction is configured)
-    if (env.ALLOWED_CHAT_IDS) {
-      const allowedIds = env.ALLOWED_CHAT_IDS.split(',').map((id) => id.trim());
-      if (!chatId || !allowedIds.includes(chatId)) {
-        console.log(`Blocked message from unauthorized chat: ${chatId}`);
-        return; // Silently ignore
-      }
-    }
+    if (!chatId) return;
 
-    // Check if user is editing a field
+    // Check if user is editing a field (tenant already resolved when photo was sent)
     const state = conversationState.get(chatId);
     if (state?.editingField) {
       const fieldIndex = parseInt(state.editingField, 10);
@@ -474,7 +532,7 @@ function getBot(env: Env): Bot {
                 { text: '[4] Editar ITBIS', callback_data: 'edit:4' },
               ],
               [
-                { text: '[5] Editar Total', callback_data: 'edit:5' },
+                { text: 'Editar Total', callback_data: 'edit:5' },
               ],
               [
                 { text: '✅ Todo Correcto', callback_data: 'confirm' },
@@ -523,7 +581,7 @@ function getBot(env: Env): Bot {
                 { text: '[4] Editar ITBIS', callback_data: 'edit:4' },
               ],
               [
-                { text: '[5] Editar Total', callback_data: 'edit:5' },
+                { text: 'Editar Total', callback_data: 'edit:5' },
               ],
               [
                 { text: '✅ Todo Correcto', callback_data: 'confirm' },
@@ -542,8 +600,15 @@ function getBot(env: Env): Bot {
     const url = extractDgiiUrl(ctx.message.text || '');
 
     if (url) {
+      // Resolve tenant for this chat
+      const tenant = resolveTenant(chatId, env);
+      if (!tenant) {
+        console.log(`Blocked message from unauthorized chat: ${chatId}`);
+        return;
+      }
+
       try {
-        await handleDgiiUrl(ctx, url, env);
+        await handleDgiiUrl(ctx, url, env, tenant);
       } catch (error) {
         console.error('Error handling DGII URL:', error);
         await ctx.reply('❌ Ocurrió un error al procesar la factura\\. Por favor intenta de nuevo\\.', { parse_mode: 'MarkdownV2' });
@@ -555,18 +620,17 @@ function getBot(env: Env): Bot {
   // Handle photo uploads
   bot.on('message:photo', async (ctx) => {
     const chatId = ctx.chat?.id?.toString();
+    if (!chatId) return;
 
-    // Check if chat is allowed (if restriction is configured)
-    if (env.ALLOWED_CHAT_IDS) {
-      const allowedIds = env.ALLOWED_CHAT_IDS.split(',').map((id) => id.trim());
-      if (!chatId || !allowedIds.includes(chatId)) {
-        console.log(`Blocked photo from unauthorized chat: ${chatId}`);
-        return;
-      }
+    // Resolve tenant for this chat
+    const tenant = resolveTenant(chatId, env);
+    if (!tenant) {
+      console.log(`Blocked photo from unauthorized chat: ${chatId}`);
+      return;
     }
 
     try {
-      await handlePhotoUpload(ctx, env);
+      await handlePhotoUpload(ctx, env, tenant);
     } catch (error) {
       console.error('Error handling photo upload:', error);
     }

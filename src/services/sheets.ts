@@ -1,5 +1,6 @@
 import type { Invoice, SheetRow, Env } from '../types.js';
 import { MONTH_NAMES, FETCH_TIMEOUT_MS } from '../types.js';
+import { getOrCreateYearFolder } from './drive.js';
 
 const SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets',
@@ -130,20 +131,21 @@ export async function getAccessToken(email: string, privateKey: string): Promise
 }
 
 /**
- * Find or create spreadsheet for the given year
+ * Find or create spreadsheet named "Reporte" inside the year folder
  */
 export async function getOrCreateSpreadsheet(
   year: number,
   accessToken: string,
   folderId?: string
 ): Promise<string> {
-  const name = `${year}`;
+  // Get or create year folder inside the root folder
+  const yearFolderId = await getOrCreateYearFolder(year, accessToken, folderId);
 
-  // Search for existing spreadsheet
+  const name = 'Reporte';
+
+  // Search for existing spreadsheet inside year folder
   let query = `name='${name}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`;
-  if (folderId) {
-    query += ` and '${folderId}' in parents`;
-  }
+  query += ` and '${yearFolderId}' in parents`;
 
   const searchResponse = await fetch(
     `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name)&supportsAllDrives=true&includeItemsFromAllDrives=true`,
@@ -167,14 +169,12 @@ export async function getOrCreateSpreadsheet(
   }
 
   console.log(`No existing spreadsheet found for ${name}, creating new one...`);
-  // Create new spreadsheet via Drive API
+  // Create new spreadsheet via Drive API inside year folder
   const createBody: Record<string, unknown> = {
     name,
     mimeType: 'application/vnd.google-apps.spreadsheet',
+    parents: [yearFolderId],
   };
-  if (folderId) {
-    createBody.parents = [folderId];
-  }
 
   // Always include supportsAllDrives for Shared Drive compatibility
   const createUrl = 'https://www.googleapis.com/drive/v3/files?supportsAllDrives=true';
@@ -453,7 +453,8 @@ export async function addInvoiceToSheet(
   invoice: Invoice,
   username: string,
   env: Env,
-  driveUrl?: string
+  driveUrl?: string,
+  spreadsheetFolderId?: string
 ): Promise<'success' | 'duplicate'> {
   const accessToken = await getAccessToken(
     env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
@@ -463,11 +464,12 @@ export async function addInvoiceToSheet(
   const year = invoice.fechaEmision.getUTCFullYear();
   const monthIndex = invoice.fechaEmision.getUTCMonth();
 
-  // Get or create spreadsheet
+  // Get or create spreadsheet (use tenant-specific folder, fallback to env)
+  const folderId = spreadsheetFolderId || env.SPREADSHEET_FOLDER_ID;
   const spreadsheetId = await getOrCreateSpreadsheet(
     year,
     accessToken,
-    env.SPREADSHEET_FOLDER_ID
+    folderId
   );
 
   // Get or create month sheet

@@ -1,6 +1,7 @@
-import type { Env } from '../types.js';
+import type { Env, TenantConfig } from '../types.js';
 import { MONTH_NAMES, FETCH_TIMEOUT_MS } from '../types.js';
 import { getAccessToken } from '../services/sheets.js';
+import { findFolder } from '../services/drive.js';
 
 const DGII_FORM_URL = 'https://dgii.gov.do/app/WebApps/ConsultasWeb2/ConsultasWeb/consultas/ncf.aspx';
 
@@ -152,7 +153,8 @@ function parseInvoiceUrl(url: string): { rncEmisor: string; encf: string; codigo
 }
 
 /**
- * Get all spreadsheets in the folder for the current and previous year
+ * Get "Reporte" spreadsheets inside year folders for the current and previous year
+ * Structure: rootFolder/{YYYY}/Reporte
  */
 async function getYearSpreadsheets(
   accessToken: string,
@@ -163,10 +165,12 @@ async function getYearSpreadsheets(
   const spreadsheets: Array<{ id: string; name: string }> = [];
 
   for (const year of years) {
-    let query = `name='${year}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`;
-    if (folderId) {
-      query += ` and '${folderId}' in parents`;
-    }
+    // First find the year folder
+    const yearFolderId = await findFolder(year.toString(), accessToken, folderId);
+    if (!yearFolderId) continue;
+
+    // Then find "Reporte" spreadsheet inside it
+    const query = `name='Reporte' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false and '${yearFolderId}' in parents`;
 
     const response = await fetch(
       `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name)&supportsAllDrives=true&includeItemsFromAllDrives=true`,
@@ -179,7 +183,8 @@ async function getYearSpreadsheets(
     if (response.ok) {
       const data = await response.json() as { files: Array<{ id: string; name: string }> };
       if (data.files?.length > 0) {
-        spreadsheets.push(...data.files);
+        // Tag with year for logging
+        spreadsheets.push(...data.files.map(f => ({ ...f, name: `${year} Reporte` })));
       }
     }
   }
@@ -285,40 +290,36 @@ async function updateRowWithItbis(
 }
 
 /**
- * Handle scheduled cron trigger
- * Searches for "Pendiente ITBIS" rows and tries to scrape ITBIS for each
+ * Process pending ITBIS rows for a single spreadsheet folder
  */
-export async function handleCron(env: Env): Promise<void> {
-  console.log('Starting cron job: processing pending ITBIS rows');
-
-  const accessToken = await getAccessToken(
-    env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    env.GOOGLE_PRIVATE_KEY
-  );
-
-  // Get spreadsheets for current and previous year
-  const spreadsheets = await getYearSpreadsheets(accessToken, env.SPREADSHEET_FOLDER_ID);
+async function processPendingForFolder(
+  accessToken: string,
+  folderId?: string,
+  tenantName?: string
+): Promise<{ pending: number; updated: number }> {
+  const label = tenantName ? `[${tenantName}] ` : '';
+  const spreadsheets = await getYearSpreadsheets(accessToken, folderId);
 
   if (spreadsheets.length === 0) {
-    console.log('No spreadsheets found');
-    return;
+    console.log(`${label}No spreadsheets found`);
+    return { pending: 0, updated: 0 };
   }
 
   let totalPending = 0;
   let totalUpdated = 0;
 
   for (const spreadsheet of spreadsheets) {
-    console.log(`Checking spreadsheet: ${spreadsheet.name}`);
+    console.log(`${label}Checking spreadsheet: ${spreadsheet.name}`);
 
     const pendingRows = await findPendingRows(spreadsheet.id, accessToken);
     totalPending += pendingRows.length;
 
     for (const row of pendingRows) {
-      console.log(`Processing pending row: ${row.encf}`);
+      console.log(`${label}Processing pending row: ${row.encf}`);
 
       const params = parseInvoiceUrl(row.url);
       if (!params) {
-        console.log(`Could not parse URL for ${row.encf}`);
+        console.log(`${label}Could not parse URL for ${row.encf}`);
         continue;
       }
 
@@ -335,13 +336,60 @@ export async function handleCron(env: Env): Promise<void> {
         );
 
         if (updated) {
-          console.log(`Updated ${row.encf} with ITBIS: ${result.itbis}`);
+          console.log(`${label}Updated ${row.encf} with ITBIS: ${result.itbis}`);
           totalUpdated++;
         }
       } else {
-        console.log(`Still could not get ITBIS for ${row.encf}`);
+        console.log(`${label}Still could not get ITBIS for ${row.encf}`);
       }
     }
+  }
+
+  return { pending: totalPending, updated: totalUpdated };
+}
+
+/**
+ * Handle scheduled cron trigger
+ * Searches for "Pendiente ITBIS" rows and tries to scrape ITBIS for each
+ * Supports multi-tenant mode: iterates over all configured tenants
+ */
+export async function handleCron(env: Env): Promise<void> {
+  console.log('Starting cron job: processing pending ITBIS rows');
+
+  const accessToken = await getAccessToken(
+    env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    env.GOOGLE_PRIVATE_KEY
+  );
+
+  let totalPending = 0;
+  let totalUpdated = 0;
+
+  // Check if multi-tenant mode is configured
+  if (env.TENANTS_CONFIG) {
+    try {
+      const tenants = JSON.parse(env.TENANTS_CONFIG) as Record<string, TenantConfig>;
+
+      // Deduplicate folder IDs (multiple chats may share the same tenant folders)
+      const processedFolders = new Set<string>();
+
+      for (const tenant of Object.values(tenants)) {
+        const folderKey = tenant.folderId || '__default__';
+        if (processedFolders.has(folderKey)) continue;
+        processedFolders.add(folderKey);
+
+        console.log(`Processing tenant: ${tenant.name}`);
+        const result = await processPendingForFolder(accessToken, tenant.folderId, tenant.name);
+        totalPending += result.pending;
+        totalUpdated += result.updated;
+      }
+    } catch (error) {
+      console.error('Failed to parse TENANTS_CONFIG in cron:', error);
+    }
+  } else {
+    // Single-tenant mode
+    const result = await processPendingForFolder(accessToken, env.SPREADSHEET_FOLDER_ID);
+    totalPending += result.pending;
+    totalUpdated += result.updated;
   }
 
   console.log(`Cron job completed. Pending: ${totalPending}, Updated: ${totalUpdated}`);
