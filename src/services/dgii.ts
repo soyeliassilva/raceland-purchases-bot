@@ -345,7 +345,7 @@ function extractAspNetFields(html: string): Record<string, string> {
  * Scrape DGII via form submission (alternative method)
  * This submits to the NCF lookup form which may be more reliable
  */
-async function scrapeViaForm(
+export async function scrapeViaForm(
   rncEmisor: string,
   encf: string,
   rncComprador: string,

@@ -1,155 +1,13 @@
 import type { Env, TenantConfig } from '../types.js';
-import { MONTH_NAMES, FETCH_TIMEOUT_MS } from '../types.js';
+import { FETCH_TIMEOUT_MS } from '../types.js';
 import { getAccessToken } from '../services/sheets.js';
 import { findFolder } from '../services/drive.js';
+import { parseUrl, scrapePage, scrapeViaForm, parseNumber } from '../services/dgii.js';
 
-const DGII_FORM_URL = 'https://dgii.gov.do/app/WebApps/ConsultasWeb2/ConsultasWeb/consultas/ncf.aspx';
-
-/**
- * Create AbortSignal with timeout
- */
 function createTimeoutSignal(ms: number): AbortSignal {
   const controller = new AbortController();
   setTimeout(() => controller.abort(), ms);
   return controller.signal;
-}
-
-/**
- * Decode HTML entities
- */
-function decodeHtmlEntities(text: string): string {
-  return text
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, code) => String.fromCharCode(parseInt(code, 16)));
-}
-
-/**
- * Extract ITBIS from DGII form response
- */
-function extractItbis(html: string): string | null {
-  const decodedHtml = decodeHtmlEntities(html);
-  const patterns = [
-    /<th[^>]*>\s*Total\s*ITBIS\s*<\/th>\s*<td[^>]*>\s*([\s\S]*?)\s*<\/td>/i,
-    /<th[^>]*>\s*ITBIS\s*Facturado\s*<\/th>\s*<td[^>]*>\s*([\s\S]*?)\s*<\/td>/i,
-    /<th[^>]*>\s*Monto\s*ITBIS\s*<\/th>\s*<td[^>]*>\s*([\s\S]*?)\s*<\/td>/i,
-  ];
-
-  for (const pattern of patterns) {
-    const match = decodedHtml.match(pattern);
-    if (match && match[1]) {
-      return match[1].trim();
-    }
-  }
-  return null;
-}
-
-/**
- * Extract status from DGII form response
- */
-function extractStatus(html: string): string | null {
-  const decodedHtml = decodeHtmlEntities(html);
-  const pattern = /<th[^>]*>\s*Estado\s*<\/th>\s*<td[^>]*>\s*([\s\S]*?)\s*<\/td>/i;
-  const match = decodedHtml.match(pattern);
-  return match ? match[1].trim() : null;
-}
-
-/**
- * Extract ASP.NET hidden fields from HTML
- */
-function extractAspNetFields(html: string): Record<string, string> {
-  const fields: Record<string, string> = {};
-  const fieldNames = ['__VIEWSTATE', '__VIEWSTATEGENERATOR', '__EVENTVALIDATION', '__EVENTTARGET', '__EVENTARGUMENT'];
-
-  for (const name of fieldNames) {
-    const pattern = new RegExp(`name="${name}"[^>]*value="([^"]*)"`, 'i');
-    const match = html.match(pattern);
-    if (match) {
-      fields[name] = match[1];
-    }
-  }
-  return fields;
-}
-
-/**
- * Try to scrape ITBIS via form submission
- */
-async function scrapeItbisViaForm(
-  rncEmisor: string,
-  encf: string,
-  codigoSeguridad: string
-): Promise<{ itbis: string; status: string } | null> {
-  try {
-    // GET the form page first
-    const getResponse = await fetch(DGII_FORM_URL, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': 'text/html',
-      },
-      signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
-    });
-
-    if (!getResponse.ok) return null;
-
-    const formHtml = await getResponse.text();
-    const aspNetFields = extractAspNetFields(formHtml);
-    if (!aspNetFields.__VIEWSTATE) return null;
-
-    // POST the form
-    const formData = new URLSearchParams();
-    for (const [key, value] of Object.entries(aspNetFields)) {
-      formData.append(key, value);
-    }
-    formData.append('ctl00$cphMain$txtRNC', rncEmisor);
-    formData.append('ctl00$cphMain$txtNCF', encf);
-    formData.append('ctl00$cphMain$txtRncComprador', ''); // Not needed for lookup
-    formData.append('ctl00$cphMain$txtCodigoSeg', codigoSeguridad.substring(0, 6));
-    formData.append('ctl00$cphMain$btnConsultar', 'Buscar');
-
-    const postResponse = await fetch(DGII_FORM_URL, {
-      method: 'POST',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: formData.toString(),
-      signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
-    });
-
-    if (!postResponse.ok) return null;
-
-    const resultHtml = await postResponse.text();
-    const itbis = extractItbis(resultHtml);
-    const status = extractStatus(resultHtml);
-
-    if (itbis) {
-      return { itbis, status: status || 'Aceptado' };
-    }
-    return null;
-  } catch (error) {
-    console.error('Error scraping ITBIS via form:', error);
-    return null;
-  }
-}
-
-/**
- * Parse URL to extract parameters
- */
-function parseInvoiceUrl(url: string): { rncEmisor: string; encf: string; codigoSeguridad: string } | null {
-  try {
-    const parsed = new URL(url);
-    const rncEmisor = parsed.searchParams.get('RncEmisor');
-    const encf = parsed.searchParams.get('ENCF');
-    const codigoSeguridad = parsed.searchParams.get('CodigoSeguridad');
-
-    if (!rncEmisor || !encf || !codigoSeguridad) return null;
-    return { rncEmisor, encf, codigoSeguridad };
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -317,26 +175,36 @@ async function processPendingForFolder(
     for (const row of pendingRows) {
       console.log(`${label}Processing pending row: ${row.encf}`);
 
-      const params = parseInvoiceUrl(row.url);
+      const params = parseUrl(row.url);
       if (!params) {
-        console.log(`${label}Could not parse URL for ${row.encf}`);
+        console.log(`${label}Could not parse DGII URL for ${row.encf}, skipping`);
         continue;
       }
 
-      const result = await scrapeItbisViaForm(params.rncEmisor, params.encf, params.codigoSeguridad);
+      // Try direct page scrape first, then form-based approach (same as initial fetch)
+      let scraped = await scrapePage(row.url);
+      if (!scraped) {
+        console.log(`${label}Direct scrape failed for ${row.encf}, trying form...`);
+        scraped = await scrapeViaForm(
+          params.rncEmisor,
+          params.encf,
+          params.rncComprador,
+          params.codigoSeguridad
+        );
+      }
 
-      if (result) {
+      if (scraped) {
         const updated = await updateRowWithItbis(
           spreadsheet.id,
           row.sheetName,
           row.rowIndex,
-          result.itbis,
-          result.status,
+          parseNumber(scraped.itbis).toFixed(2),
+          scraped.status,
           accessToken
         );
 
         if (updated) {
-          console.log(`${label}Updated ${row.encf} with ITBIS: ${result.itbis}`);
+          console.log(`${label}Updated ${row.encf} with ITBIS: ${scraped.itbis}`);
           totalUpdated++;
         }
       } else {
