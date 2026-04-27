@@ -285,39 +285,6 @@ export async function getOrCreateSheet(
 }
 
 /**
- * Check if ENCF already exists in the month sheet (column C)
- */
-export async function isDuplicate(
-  spreadsheetId: string,
-  sheetName: string,
-  encf: string,
-  accessToken: string
-): Promise<boolean> {
-  const response = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!C:C`,
-    {
-      headers: { Authorization: `Bearer ${accessToken}` },
-      signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
-    }
-  );
-
-  if (!response.ok) {
-    // If sheet doesn't exist yet, not a duplicate
-    if (response.status === 400) {
-      return false;
-    }
-    throw new Error(`Duplicate check failed: ${response.status}`);
-  }
-
-  const data = await response.json() as { values?: string[][] };
-  if (!data.values) {
-    return false;
-  }
-
-  return data.values.some((row) => row[0] === encf);
-}
-
-/**
  * Check if (seller RNC + ENCF) combination already exists in the month sheet
  * Checks both column D (RNC Vendedor) and column C (ENCF)
  */
@@ -475,15 +442,9 @@ export async function addInvoiceToSheet(
   // Get or create month sheet
   const sheetName = await getOrCreateSheet(spreadsheetId, monthIndex, accessToken);
 
-  // Check for duplicate in the month sheet (use enhanced check for photo invoices)
-  if (invoice.source === 'photo') {
-    if (await isDuplicateWithRnc(spreadsheetId, sheetName, invoice.rncEmisor, invoice.encf, accessToken)) {
-      return 'duplicate';
-    }
-  } else {
-    if (await isDuplicate(spreadsheetId, sheetName, invoice.encf, accessToken)) {
-      return 'duplicate';
-    }
+  // Check for duplicate in the month sheet (check both seller RNC + invoice number)
+  if (await isDuplicateWithRnc(spreadsheetId, sheetName, invoice.rncEmisor, invoice.encf, accessToken)) {
+    return 'duplicate';
   }
 
   // Look up vendor name from DGII if not already available

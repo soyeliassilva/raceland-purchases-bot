@@ -372,6 +372,15 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
   const { data, photoBuffer, tenant } = state;
 
   try {
+    // Require seller RNC for duplicate detection
+    if (!data.rncEmisor) {
+      await ctx.reply(
+        '⚠️ El RNC del emisor es obligatorio\\. Usa el botón *Editar RNC* para agregarlo\\.',
+        { parse_mode: 'MarkdownV2' }
+      );
+      return;
+    }
+
     await ctx.reply('💾 Guardando la factura\\.\\.\\.', { parse_mode: 'MarkdownV2' });
 
     const accessToken = await getAccessToken(
