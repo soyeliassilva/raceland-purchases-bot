@@ -2,7 +2,7 @@ import { Bot, Context, webhookCallback } from 'grammy';
 import type { Env, Invoice, ExtractedInvoiceData, TenantConfig } from './types.js';
 import { MONTH_NAMES } from './types.js';
 import { extractDgiiUrl, fetchInvoice, parseNumber, lookupRncName } from './services/dgii.js';
-import { addInvoiceToSheet, getAccessToken } from './services/sheets.js';
+import { addInvoiceToSheet, getAccessToken, findSpreadsheet, getMonthTotals } from './services/sheets.js';
 import { extractInvoiceData, parseReceiptDate } from './services/ocr.js';
 import { getOrCreateReceiptFolder, uploadReceiptImage } from './services/drive.js';
 
@@ -510,6 +510,102 @@ function getBot(env: Env): Bot {
   }
 
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
+
+  // Handle /resumen command — show monthly ITBIS and Total summary
+  bot.command('resumen', async (ctx) => {
+    const chatId = ctx.chat?.id?.toString();
+    if (!chatId) return;
+
+    const tenant = resolveTenant(chatId, env);
+    if (!tenant) return;
+
+    // Parse arguments: /resumen [month] [year]
+    const args = ctx.match?.toString().trim().split(/\s+/) || [];
+    const now = new Date();
+    let monthIndex: number;
+    let year: number;
+
+    if (args.length === 0 || args[0] === '') {
+      // No args — use current month
+      monthIndex = now.getUTCMonth();
+      year = now.getUTCFullYear();
+    } else {
+      // Parse month (name or number)
+      const monthArg = args[0].toLowerCase();
+      const monthByName = MONTH_NAMES.findIndex(
+        (m) => m.toLowerCase().startsWith(monthArg)
+      );
+      if (monthByName >= 0) {
+        monthIndex = monthByName;
+      } else {
+        const monthNum = parseInt(monthArg, 10);
+        if (monthNum >= 1 && monthNum <= 12) {
+          monthIndex = monthNum - 1;
+        } else {
+          await ctx.reply('❌ Mes no válido\\. Usa un nombre \\(Enero, Feb\\.\\.\\.\\) o número \\(1\\-12\\)\\.', { parse_mode: 'MarkdownV2' });
+          return;
+        }
+      }
+
+      // Parse optional year
+      if (args.length >= 2) {
+        year = parseInt(args[1], 10);
+        if (isNaN(year) || year < 2000 || year > 2100) {
+          await ctx.reply('❌ Año no válido\\.', { parse_mode: 'MarkdownV2' });
+          return;
+        }
+      } else {
+        year = now.getUTCFullYear();
+      }
+    }
+
+    try {
+      const accessToken = await getAccessToken(
+        env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+        env.GOOGLE_PRIVATE_KEY
+      );
+
+      const folderId = tenant.folderId || env.SPREADSHEET_FOLDER_ID;
+      const spreadsheetId = await findSpreadsheet(year, accessToken, folderId);
+
+      if (!spreadsheetId) {
+        const sheetName = MONTH_NAMES[monthIndex];
+        await ctx.reply(
+          `📊 *Resumen de ${escapeMarkdown(sheetName)} ${year}*\n\nNo hay facturas registradas\\.`,
+          { parse_mode: 'MarkdownV2' }
+        );
+        return;
+      }
+
+      const sheetName = MONTH_NAMES[monthIndex];
+      const totals = await getMonthTotals(spreadsheetId, sheetName, accessToken);
+
+      if (!totals || totals.rowCount === 0) {
+        await ctx.reply(
+          `📊 *Resumen de ${escapeMarkdown(sheetName)} ${year}*\n\nNo hay facturas registradas\\.`,
+          { parse_mode: 'MarkdownV2' }
+        );
+        return;
+      }
+
+      const itbisStr = escapeMarkdown(totals.totalItbis.toFixed(2));
+      const totalStr = escapeMarkdown(totals.totalAmount.toFixed(2));
+
+      await ctx.reply(
+        [
+          `📊 *Resumen de ${escapeMarkdown(sheetName)} ${year}*`,
+          '',
+          `📄 Facturas: ${totals.rowCount}`,
+          `📊 ITBIS Total: RD\\$${itbisStr}`,
+          `💰 Monto Total: RD\\$${totalStr}`,
+        ].join('\n'),
+        { parse_mode: 'MarkdownV2' }
+      );
+    } catch (error) {
+      console.error('Error fetching month totals:', error);
+      await ctx.reply('❌ Ocurrió un error al consultar los totales\\.', { parse_mode: 'MarkdownV2' });
+    }
+  });
 
   // Handle all text messages
   bot.on('message:text', async (ctx) => {

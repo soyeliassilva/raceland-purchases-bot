@@ -1,6 +1,6 @@
 import type { Invoice, SheetRow, Env } from '../types.js';
 import { MONTH_NAMES, FETCH_TIMEOUT_MS } from '../types.js';
-import { getOrCreateYearFolder } from './drive.js';
+import { getOrCreateYearFolder, findFolder } from './drive.js';
 
 const SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets',
@@ -128,6 +128,34 @@ export async function getAccessToken(email: string, privateKey: string): Promise
 
   console.log('Token obtained successfully');
   return data.access_token;
+}
+
+/**
+ * Find spreadsheet named "Reporte" inside the year folder (read-only, no creation)
+ */
+export async function findSpreadsheet(
+  year: number,
+  accessToken: string,
+  folderId?: string
+): Promise<string | null> {
+  const yearFolderId = await findFolder(year.toString(), accessToken, folderId);
+  if (!yearFolderId) return null;
+
+  const name = 'Reporte';
+  const query = `name='${name}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false and '${yearFolderId}' in parents`;
+
+  const response = await fetch(
+    `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name)&supportsAllDrives=true&includeItemsFromAllDrives=true`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
+    }
+  );
+
+  if (!response.ok) return null;
+
+  const data = await response.json() as { files: Array<{ id: string }> };
+  return data.files?.[0]?.id || null;
 }
 
 /**
@@ -365,6 +393,62 @@ export async function appendRow(
   if (!response.ok) {
     throw new Error(`Row append failed: ${response.status}`);
   }
+}
+
+/**
+ * Read a month sheet and return summed ITBIS and Total values
+ */
+export async function getMonthTotals(
+  spreadsheetId: string,
+  sheetName: string,
+  accessToken: string
+): Promise<{ totalItbis: number; totalAmount: number; rowCount: number } | null> {
+  // Read columns F (ITBIS) and G (Total), skipping header row
+  const response = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!F2:G`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
+    }
+  );
+
+  if (!response.ok) {
+    if (response.status === 400) {
+      // Sheet doesn't exist
+      return null;
+    }
+    throw new Error(`Failed to read month totals: ${response.status}`);
+  }
+
+  const data = await response.json() as { values?: string[][] };
+  if (!data.values || data.values.length === 0) {
+    return { totalItbis: 0, totalAmount: 0, rowCount: 0 };
+  }
+
+  let totalItbis = 0;
+  let totalAmount = 0;
+  let rowCount = 0;
+
+  for (const row of data.values) {
+    const itbisVal = row[0] ? parseFloat(row[0]) : 0;
+    const totalVal = row[1] ? parseFloat(row[1]) : 0;
+
+    if (!isNaN(totalVal) && totalVal > 0) {
+      rowCount++;
+    }
+    if (!isNaN(itbisVal)) {
+      totalItbis += itbisVal;
+    }
+    if (!isNaN(totalVal)) {
+      totalAmount += totalVal;
+    }
+  }
+
+  return {
+    totalItbis: Math.round(totalItbis * 100) / 100,
+    totalAmount: Math.round(totalAmount * 100) / 100,
+    rowCount,
+  };
 }
 
 /**

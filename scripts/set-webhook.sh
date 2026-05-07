@@ -31,4 +31,16 @@ curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setWebhook" \
   }"
 
 echo ""
+
+echo "Setting bot commands..."
+
+curl -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "commands": [
+      {"command": "resumen", "description": "Ver resumen de ITBIS y totales del mes"}
+    ]
+  }'
+
+echo ""
 echo "Done! Verify with: curl https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo"
