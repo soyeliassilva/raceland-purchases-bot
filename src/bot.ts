@@ -588,8 +588,9 @@ function getBot(env: Env): Bot {
         return;
       }
 
-      const itbisStr = escapeMarkdown(totals.totalItbis.toFixed(2));
-      const totalStr = escapeMarkdown(totals.totalAmount.toFixed(2));
+      const formatCurrency = (n: number) => n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      const itbisStr = escapeMarkdown(formatCurrency(totals.totalItbis));
+      const totalStr = escapeMarkdown(formatCurrency(totals.totalAmount));
 
       await ctx.reply(
         [
