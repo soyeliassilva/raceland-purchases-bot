@@ -128,6 +128,7 @@ export async function extractInvoiceData(
   "rncComprador": "buyer/client RNC (usually labeled RNC Comprador or Cliente)",
   "ncf": "NCF or ENCF number (starts with a letter like E or B)",
   "fechaEmision": "invoice date in DD-MM-YYYY format",
+  "propina": "mandatory legal tip/service amount as number (look for Propina Legal, 10% de ley, Servicio Legal, or Ley 10%)",
   "itbis": "ITBIS tax amount as number",
   "montoTotal": "total amount as number"
 }
@@ -139,7 +140,8 @@ IMPORTANT:
 - If a field cannot be read, use null for its value.
 - For the NCF/ENCF field, extract exactly as shown (ENCF starts with E, NCF starts with a letter).
 - For dates, always use DD-MM-YYYY format.
-- For amounts, use numbers only (no currency symbols).`;
+- For amounts, use numbers only (no currency symbols).
+- For propina, return the absolute money amount, not the percentage. If no legal tip/service line appears, return 0.`;
 
     // Call Cloudflare Workers AI with OpenAI-compatible messages format
     const response = await ai.run(MODEL, {
@@ -217,6 +219,17 @@ IMPORTANT:
     }
 
     // Parse amounts
+    if (extracted.propina !== null && extracted.propina !== undefined) {
+      const propina = typeof extracted.propina === 'string'
+        ? extracted.propina.includes('%')
+          ? NaN
+          : parseNumber(extracted.propina)
+        : extracted.propina;
+      result.propina = !isNaN(propina) && propina >= 0 ? propina : 0;
+    } else {
+      result.propina = 0;
+    }
+
     if (extracted.itbis !== null && extracted.itbis !== undefined) {
       const itbis = typeof extracted.itbis === 'string'
         ? parseNumber(extracted.itbis)
@@ -233,6 +246,15 @@ IMPORTANT:
       if (!isNaN(total)) {
         result.montoTotal = total;
       }
+    }
+
+    const normalizedTotal = typeof result.montoTotal === 'number'
+      ? result.montoTotal
+      : result.montoTotal !== undefined
+        ? parseNumber(result.montoTotal)
+        : undefined;
+    if (result.propina !== undefined && normalizedTotal !== undefined && result.propina > normalizedTotal) {
+      result.propina = 0;
     }
 
     // Fix swapped RNCs: if the "seller" RNC matches the known buyer, swap them

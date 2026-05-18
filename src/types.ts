@@ -30,6 +30,7 @@ export interface Invoice {
   encf: string;
   fechaEmision: Date;
   montoTotal: number;
+  propina: number; // Absolute legal tip amount, 0.00 when not present
   codigoSeguridad: string | null; // null for photo invoices
   // From scrape (optional - may be null if scrape fails)
   vendorName: string | null;
@@ -44,7 +45,7 @@ export interface Invoice {
 
 /**
  * Row format for Google Sheets
- * Columns: Fecha | Estado | ENCF | RNC Vendedor | Nombre Vendedor | ITBIS | Total | URL | Añadido Por | Añadido El
+ * Columns: Fecha | Estado | ENCF | RNC Vendedor | Nombre Vendedor | Propina | ITBIS | Total | URL | Añadido Por | Añadido El
  */
 export interface SheetRow {
   date: string;
@@ -52,6 +53,7 @@ export interface SheetRow {
   encf: string;
   vendorRnc: string;
   vendorName: string;
+  propina: string;
   itbis: string;
   total: string;
   url: string;
@@ -68,8 +70,9 @@ export interface ExtractedInvoiceData {
   rncComprador?: string;
   ncf?: string;
   fechaEmision?: string;
-  itbis?: number;
-  montoTotal?: number;
+  itbis?: number | string;
+  montoTotal?: number | string;
+  propina?: number | string;
   vendorName?: string;
 }
 

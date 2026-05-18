@@ -10,6 +10,21 @@ function createTimeoutSignal(ms: number): AbortSignal {
   return controller.signal;
 }
 
+function columnLetter(index: number): string {
+  let letter = '';
+  let value = index + 1;
+  while (value > 0) {
+    const remainder = (value - 1) % 26;
+    letter = String.fromCharCode(65 + remainder) + letter;
+    value = Math.floor((value - 1) / 26);
+  }
+  return letter;
+}
+
+function headerIndex(headers: string[], name: string): number {
+  return headers.findIndex((header) => header.trim().toLowerCase() === name.toLowerCase());
+}
+
 /**
  * Get "Reporte" spreadsheets inside year folders for the current and previous year
  * Structure: rootFolder/{YYYY}/Reporte
@@ -56,8 +71,22 @@ async function getYearSpreadsheets(
 async function findPendingRows(
   spreadsheetId: string,
   accessToken: string
-): Promise<Array<{ sheetName: string; rowIndex: number; url: string; encf: string }>> {
-  const pending: Array<{ sheetName: string; rowIndex: number; url: string; encf: string }> = [];
+): Promise<Array<{
+  sheetName: string;
+  rowIndex: number;
+  url: string;
+  encf: string;
+  statusColumn: string;
+  itbisColumn: string;
+}>> {
+  const pending: Array<{
+    sheetName: string;
+    rowIndex: number;
+    url: string;
+    encf: string;
+    statusColumn: string;
+    itbisColumn: string;
+  }> = [];
 
   // Get all sheet names
   const metaResponse = await fetch(
@@ -75,10 +104,9 @@ async function findPendingRows(
   for (const sheet of metaData.sheets) {
     const sheetName = sheet.properties.title;
 
-    // Get all data from this sheet
-    // Columns: A=Fecha, B=Estado, C=ENCF, D=RNC, E=Nombre, F=ITBIS, G=Total, H=URL
+    // Get all data from this sheet; derive columns from headers to support Propina.
     const dataResponse = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!A:H`,
+      `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!A:K`,
       {
         headers: { Authorization: `Bearer ${accessToken}` },
         signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
@@ -88,17 +116,30 @@ async function findPendingRows(
     if (!dataResponse.ok) continue;
 
     const data = await dataResponse.json() as { values?: string[][] };
-    if (!data.values) continue;
+    if (!data.values || data.values.length <= 1) continue;
 
-    // Skip header row, find rows with "Pendiente ITBIS" in column B (index 1)
+    const headers = data.values[0] || [];
+    const statusIndex = headerIndex(headers, 'Estado');
+    const encfIndex = headerIndex(headers, 'ENCF');
+    const itbisIndex = headerIndex(headers, 'ITBIS');
+    const urlIndex = headerIndex(headers, 'URL');
+
+    if (statusIndex === -1 || encfIndex === -1 || itbisIndex === -1 || urlIndex === -1) {
+      console.error(`Skipping ${sheetName}: missing required headers for cron retry`);
+      continue;
+    }
+
+    // Skip header row and find rows with pending ITBIS status.
     for (let i = 1; i < data.values.length; i++) {
       const row = data.values[i];
-      if (row[1] === 'Pendiente ITBIS' && row[7]) { // Column B = status, Column H = URL
+      if (row[statusIndex] === 'Pendiente ITBIS' && row[urlIndex]) {
         pending.push({
           sheetName,
           rowIndex: i + 1, // 1-indexed for Sheets API
-          url: row[7],
-          encf: row[2] || '',
+          url: row[urlIndex],
+          encf: row[encfIndex] || '',
+          statusColumn: columnLetter(statusIndex),
+          itbisColumn: columnLetter(itbisIndex),
         });
       }
     }
@@ -116,9 +157,10 @@ async function updateRowWithItbis(
   rowIndex: number,
   itbis: string,
   status: string,
+  statusColumn: string,
+  itbisColumn: string,
   accessToken: string
 ): Promise<boolean> {
-  // Update columns B (status) and F (ITBIS)
   const response = await fetch(
     `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchUpdate`,
     {
@@ -131,11 +173,11 @@ async function updateRowWithItbis(
         valueInputOption: 'RAW',
         data: [
           {
-            range: `${sheetName}!B${rowIndex}`,
+            range: `${sheetName}!${statusColumn}${rowIndex}`,
             values: [[status]],
           },
           {
-            range: `${sheetName}!F${rowIndex}`,
+            range: `${sheetName}!${itbisColumn}${rowIndex}`,
             values: [[itbis]],
           },
         ],
@@ -200,6 +242,8 @@ async function processPendingForFolder(
           row.rowIndex,
           parseNumber(scraped.itbis).toFixed(2),
           scraped.status,
+          row.statusColumn,
+          row.itbisColumn,
           accessToken
         );
 

@@ -2,7 +2,7 @@ import { Bot, Context, webhookCallback } from 'grammy';
 import type { Env, Invoice, ExtractedInvoiceData, TenantConfig } from './types.js';
 import { MONTH_NAMES } from './types.js';
 import { extractDgiiUrl, fetchInvoice, parseNumber, lookupRncName } from './services/dgii.js';
-import { addInvoiceToSheet, getAccessToken, findSpreadsheet, getMonthTotals } from './services/sheets.js';
+import { addInvoiceToSheet, getAccessToken, findSpreadsheet, getMonthTotals, invoiceExists } from './services/sheets.js';
 import { extractInvoiceData, parseReceiptDate } from './services/ocr.js';
 import { getOrCreateReceiptFolder, uploadReceiptImage } from './services/drive.js';
 
@@ -55,15 +55,34 @@ function resolveTenant(chatId: string, env: Env): TenantConfig | null {
   };
 }
 
-// Conversation state for photo upload confirmation (persists within single Worker invocation)
-// Map<chatId, { data, timestamp, editingField?, photoBuffer, tenant }>
-const conversationState = new Map<string, {
+type PhotoConversationState = {
+  kind: 'photo';
   data: ExtractedInvoiceData;
   timestamp: number;
+  userId?: number;
+  promptMessageId?: number;
   editingField?: string;
   photoBuffer: ArrayBuffer;
   tenant: TenantConfig;
-}>();
+};
+
+type UrlPropinaConversationState = {
+  kind: 'url-propina';
+  invoice: Invoice;
+  timestamp: number;
+  userId?: number;
+  promptMessageId?: number;
+  tenant: TenantConfig;
+  username: string;
+  awaitingPropinaAmount?: boolean;
+  processing?: boolean;
+  readyToRetry?: boolean;
+};
+
+type ConversationState = PhotoConversationState | UrlPropinaConversationState;
+
+// Conversation state for photo confirmation and URL propina prompts
+const conversationState = new Map<string, ConversationState>();
 
 // Session timeout (5 minutes)
 const SESSION_TIMEOUT_MS = 5 * 60 * 1000;
@@ -93,7 +112,8 @@ function formatSuccessMessage(invoice: Invoice): string {
   const month = MONTH_NAMES[invoice.fechaEmision.getUTCMonth()];
   const year = invoice.fechaEmision.getUTCFullYear();
   const total = escapeMarkdown(invoice.montoTotal.toFixed(2));
-  const itbis = invoice.itbis ? escapeMarkdown(invoice.itbis.toFixed(2)) : 'N/A';
+  const propina = escapeMarkdown(invoice.propina.toFixed(2));
+  const itbis = invoice.itbis !== null ? escapeMarkdown(invoice.itbis.toFixed(2)) : 'N/A';
 
   return [
     '✅ *Factura Agregada*',
@@ -101,6 +121,7 @@ function formatSuccessMessage(invoice: Invoice): string {
     `📄 ENCF: \`${invoice.encf}\``,
     `🏢 Vendedor: ${escapeMarkdown(invoice.vendorName || invoice.rncEmisor)}`,
     `💰 Total: RD\\$${total}`,
+    `💵 Propina: RD\\$${propina}`,
     `📊 ITBIS: RD\\$${itbis}`,
     '',
     `📁 Agregado a: ${escapeMarkdown(month)} ${year}`,
@@ -114,6 +135,7 @@ function formatPendingMessage(invoice: Invoice): string {
   const month = MONTH_NAMES[invoice.fechaEmision.getUTCMonth()];
   const year = invoice.fechaEmision.getUTCFullYear();
   const total = escapeMarkdown(invoice.montoTotal.toFixed(2));
+  const propina = escapeMarkdown(invoice.propina.toFixed(2));
 
   return [
     '⏳ *Factura Agregada \\- Pendiente ITBIS*',
@@ -121,6 +143,7 @@ function formatPendingMessage(invoice: Invoice): string {
     `📄 ENCF: \`${invoice.encf}\``,
     `🏢 Vendedor: ${escapeMarkdown(invoice.rncEmisor)}`,
     `💰 Total: RD\\$${total}`,
+    `💵 Propina: RD\\$${propina}`,
     '',
     'El ITBIS no está disponible aún en DGII\\.',
     'Se reintentará automáticamente\\.',
@@ -162,24 +185,97 @@ function formatConfirmationMessage(data: ExtractedInvoiceData): string {
   if (data.fechaEmision) {
     lines.push(`📅 Fecha: \`${data.fechaEmision}\``);
   }
+  const propina = typeof data.propina === 'number'
+    ? data.propina
+    : data.propina !== undefined
+      ? parseNumber(String(data.propina))
+      : 0;
+  lines.push(`💵 Propina: RD\\$${escapeMarkdown(propina.toFixed(2))}`);
   if (data.itbis !== undefined) {
-    const itbisStr = data.itbis.toFixed(2);
+    const itbisValue = typeof data.itbis === 'number' ? data.itbis : parseNumber(data.itbis);
+    const itbisStr = itbisValue.toFixed(2);
     const escapedItbis = escapeMarkdown(itbisStr);
-    console.log(`ITBIS DEBUG: original="${itbisStr}" escaped="${escapedItbis}"`);
     lines.push(`📊 ITBIS: RD\\$${escapedItbis}`);
   }
   if (data.montoTotal !== undefined) {
-    const totalStr = data.montoTotal.toFixed(2);
+    const totalValue = typeof data.montoTotal === 'number' ? data.montoTotal : parseNumber(data.montoTotal);
+    const totalStr = totalValue.toFixed(2);
     const escapedTotal = escapeMarkdown(totalStr);
-    console.log(`TOTAL DEBUG: original="${totalStr}" escaped="${escapedTotal}"`);
     lines.push(`💰 Total: RD\\$${escapedTotal}`);
   }
 
   lines.push('', 'Por favor, verifica los datos\\. Puedes editar un campo seleccionando el número correspondiente\\.');
 
-  const result = lines.join('\n');
-  console.log('FULL MESSAGE DEBUG:', result);
-  return result;
+  return lines.join('\n');
+}
+
+function getPhotoConfirmationKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: 'Editar RNC', callback_data: 'edit:1' },
+        { text: 'Editar NCF', callback_data: 'edit:2' },
+      ],
+      [
+        { text: 'Editar Fecha', callback_data: 'edit:3' },
+        { text: 'Editar Propina', callback_data: 'edit:4' },
+      ],
+      [
+        { text: 'Editar ITBIS', callback_data: 'edit:5' },
+        { text: 'Editar Total', callback_data: 'edit:6' },
+      ],
+      [
+        { text: '✅ Todo Correcto', callback_data: 'confirm' },
+        { text: '❌ Cancelar', callback_data: 'cancel' },
+      ],
+    ],
+  };
+}
+
+function getUrlPropinaKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: 'Sí', callback_data: 'propina:yes' },
+        { text: 'No', callback_data: 'propina:no' },
+      ],
+      [
+        { text: '❌ Cancelar', callback_data: 'cancel' },
+      ],
+    ],
+  };
+}
+
+function getUrlRetryKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: 'Reintentar', callback_data: 'propina:retry' },
+        { text: '❌ Cancelar', callback_data: 'cancel' },
+      ],
+    ],
+  };
+}
+
+function isStateOwner(ctx: Context, state: ConversationState): boolean {
+  return !state.userId || !ctx.from?.id || state.userId === ctx.from.id;
+}
+
+function isCurrentPrompt(ctx: Context, state: ConversationState): boolean {
+  return !state.promptMessageId
+    || state.promptMessageId === ctx.callbackQuery?.message?.message_id;
+}
+
+function parseAmountInput(value: string): number | null {
+  if (value.includes('%')) return null;
+  const amount = parseNumber(value);
+  return Number.isFinite(amount) && amount >= 0 ? amount : null;
+}
+
+function extractNumericValue(value: number | string | undefined): number | null {
+  if (value === undefined) return null;
+  const amount = typeof value === 'number' ? value : parseNumber(value);
+  return Number.isFinite(amount) ? amount : null;
 }
 
 /**
@@ -190,8 +286,9 @@ function getFieldLabel(fieldIndex: number): string {
     1: 'RNC',
     2: 'NCF',
     3: 'Fecha',
-    4: 'ITBIS',
-    5: 'Total',
+    4: 'Propina',
+    5: 'ITBIS',
+    6: 'Total',
   };
   return labels[fieldIndex as keyof typeof labels] || 'campo';
 }
@@ -226,10 +323,11 @@ function validateFieldInput(fieldIndex: number, value: string): { valid: boolean
       }
       return { valid: false };
 
-    case 4: // ITBIS
-    case 5: // Monto Total
-      const num = parseNumber(trimmed);
-      if (!isNaN(num) && num >= 0) {
+    case 4: // Propina
+    case 5: // ITBIS
+    case 6: // Monto Total
+      const num = parseAmountInput(trimmed);
+      if (num !== null) {
         return { valid: true, parsedValue: num };
       }
       return { valid: false };
@@ -261,6 +359,11 @@ async function handlePhotoUpload(ctx: Context, env: Env, tenant: TenantConfig): 
   try {
     // Clean up expired states first
     cleanupExpiredStates();
+
+    if (conversationState.has(chatId)) {
+      await ctx.reply('Hay una factura pendiente en este chat\\. Confírmala o cancélala antes de enviar otra\\.', { parse_mode: 'MarkdownV2' });
+      return;
+    }
 
     // Get the highest resolution photo
     const photos = ctx.message?.photo;
@@ -314,43 +417,24 @@ async function handlePhotoUpload(ctx: Context, env: Env, tenant: TenantConfig): 
 
     // Store conversation state (including tenant for later use in confirmation)
     conversationState.set(chatId, {
+      kind: 'photo',
       data: extractedData,
       timestamp: Date.now(),
+      userId: ctx.from?.id,
       photoBuffer,
       tenant,
     });
 
-    // Build inline keyboard
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: 'Editar RNC', callback_data: 'edit:1' },
-          { text: 'Editar NCF', callback_data: 'edit:2' },
-        ],
-        [
-          { text: 'Editar Fecha', callback_data: 'edit:3' },
-          { text: 'Editar ITBIS', callback_data: 'edit:4' },
-        ],
-        [
-          { text: 'Editar Total', callback_data: 'edit:5' },
-        ],
-        [
-          { text: '✅ Todo Correcto', callback_data: 'confirm' },
-          { text: '❌ Cancelar', callback_data: 'cancel' },
-        ],
-      ],
-    };
-
     const message = formatConfirmationMessage(extractedData);
-    console.log('=== ABOUT TO SEND MESSAGE ===');
-    console.log('Message text:', message);
-    console.log('Message length:', message.length);
-    console.log('============================');
 
-    await ctx.reply(message, {
+    const confirmation = await ctx.reply(message, {
       parse_mode: 'MarkdownV2',
-      reply_markup: keyboard,
+      reply_markup: getPhotoConfirmationKeyboard(),
     });
+    const state = conversationState.get(chatId);
+    if (state?.kind === 'photo') {
+      state.promptMessageId = confirmation.message_id;
+    }
   } catch (error) {
     const errorMsg = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     console.error('Error handling photo upload:', errorMsg);
@@ -367,7 +451,7 @@ async function handlePhotoUpload(ctx: Context, env: Env, tenant: TenantConfig): 
  */
 async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): Promise<void> {
   const state = conversationState.get(chatId);
-  if (!state) return;
+  if (!state || state.kind !== 'photo') return;
 
   const { data, photoBuffer, tenant } = state;
 
@@ -405,16 +489,31 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
     const filename = `${day}-${month}-${year} - NCF ${data.ncf || 'desconocido'}.jpg`;
     const { webViewLink } = await uploadReceiptImage(photoBuffer, filename, monthFolderId, accessToken);
 
+    const montoTotal = typeof data.montoTotal === 'number'
+      ? data.montoTotal
+      : data.montoTotal !== undefined
+        ? parseNumber(data.montoTotal)
+        : 0;
+    const propina = typeof data.propina === 'number'
+      ? data.propina
+      : data.propina !== undefined
+        ? parseNumber(String(data.propina))
+        : 0;
+    const itbis = data.itbis !== undefined
+      ? (typeof data.itbis === 'number' ? data.itbis : parseNumber(data.itbis))
+      : null;
+
     // Create invoice object
     const invoice: Invoice = {
       rncEmisor: data.rncEmisor || '',
       rncComprador: data.rncComprador,
       encf: data.ncf || '',
       fechaEmision,
-      montoTotal: data.montoTotal || 0,
+      montoTotal: isNaN(montoTotal) ? 0 : montoTotal,
+      propina: isNaN(propina) ? 0 : propina,
       codigoSeguridad: null, // Photos don't have security codes
       vendorName: data.vendorName || null,
-      itbis: data.itbis || null,
+      itbis: itbis !== null && !isNaN(itbis) ? itbis : null,
       status: 'Aceptado',
       source: 'photo',
       invoiceType: data.ncf?.startsWith('E') ? 'electronica' : 'papel',
@@ -429,6 +528,7 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
     } else {
       const month = MONTH_NAMES[monthIndex];
       const total = escapeMarkdown(invoice.montoTotal.toFixed(2));
+      const propina = escapeMarkdown(invoice.propina.toFixed(2));
       const itbis = invoice.itbis !== null ? escapeMarkdown(invoice.itbis.toFixed(2)) : 'N/A';
 
       await ctx.reply(
@@ -438,6 +538,7 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
           `📄 NCF/ENCF: \`${invoice.encf}\``,
           `🏢 Vendedor: \`${invoice.rncEmisor}\``,
           `💰 Total: RD\\$${total}`,
+          `💵 Propina: RD\\$${propina}`,
           `📊 ITBIS: RD\\$${itbis}`,
           '',
           `📁 Agregada a: ${escapeMarkdown(month)} ${year}`,
@@ -453,6 +554,47 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
   }
 }
 
+async function processUrlInvoice(ctx: Context, chatId: string, env: Env): Promise<void> {
+  const state = conversationState.get(chatId);
+  if (!state || state.kind !== 'url-propina') return;
+  if (state.processing) return;
+
+  state.processing = true;
+  try {
+    await ctx.reply('💾 Guardando la factura\\.\\.\\.', { parse_mode: 'MarkdownV2' });
+
+    const sheetResult = await addInvoiceToSheet(
+      state.invoice,
+      state.username,
+      env,
+      undefined,
+      state.tenant.folderId
+    );
+
+    if (sheetResult === 'duplicate') {
+      await ctx.reply(formatDuplicateMessage(state.invoice.encf), { parse_mode: 'MarkdownV2' });
+      conversationState.delete(chatId);
+      return;
+    }
+
+    if (state.invoice.status === 'Pendiente ITBIS') {
+      await ctx.reply(formatPendingMessage(state.invoice), { parse_mode: 'MarkdownV2' });
+    } else {
+      await ctx.reply(formatSuccessMessage(state.invoice), { parse_mode: 'MarkdownV2' });
+    }
+    conversationState.delete(chatId);
+  } catch (error) {
+    console.error('Error processing URL invoice:', error);
+    state.processing = false;
+    state.readyToRetry = true;
+    const retryPrompt = await ctx.reply('❌ Ocurrió un error al guardar la factura\\. Puedes reintentar o cancelar\\.', {
+      parse_mode: 'MarkdownV2',
+      reply_markup: getUrlRetryKeyboard(),
+    });
+    state.promptMessageId = retryPrompt.message_id;
+  }
+}
+
 /**
  * Handle DGII URL in message
  */
@@ -462,6 +604,15 @@ async function handleDgiiUrl(
   env: Env,
   tenant: TenantConfig
 ): Promise<void> {
+  const chatId = ctx.chat?.id?.toString();
+  if (!chatId) return;
+  cleanupExpiredStates();
+
+  if (conversationState.has(chatId)) {
+    await ctx.reply('Hay una factura pendiente en este chat\\. Confírmala o cancélala antes de enviar otra\\.', { parse_mode: 'MarkdownV2' });
+    return;
+  }
+
   const result = await fetchInvoice(url);
 
   if (result === 'invalid_url') {
@@ -484,19 +635,26 @@ async function handleDgiiUrl(
 
   const username = getUsername(ctx);
 
-  // Always add to sheet (even if ITBIS is pending)
-  const sheetResult = await addInvoiceToSheet(result, username, env, undefined, tenant.folderId);
-
-  if (sheetResult === 'duplicate') {
+  if (await invoiceExists(result, env, tenant.folderId)) {
     await ctx.reply(formatDuplicateMessage(result.encf), { parse_mode: 'MarkdownV2' });
     return;
   }
 
-  // Send appropriate message based on status
-  if (result.status === 'Pendiente ITBIS') {
-    await ctx.reply(formatPendingMessage(result), { parse_mode: 'MarkdownV2' });
-  } else {
-    await ctx.reply(formatSuccessMessage(result), { parse_mode: 'MarkdownV2' });
+  conversationState.set(chatId, {
+    kind: 'url-propina',
+    invoice: { ...result, propina: 0 },
+    timestamp: Date.now(),
+    userId: ctx.from?.id,
+    tenant,
+    username,
+  });
+
+  const prompt = await ctx.reply('¿Esta factura tiene propina?', {
+    reply_markup: getUrlPropinaKeyboard(),
+  });
+  const state = conversationState.get(chatId);
+  if (state?.kind === 'url-propina') {
+    state.promptMessageId = prompt.message_id;
   }
 }
 
@@ -614,45 +772,82 @@ function getBot(env: Env): Bot {
     console.log(`Message received from chat: ${chatId}`);
 
     if (!chatId) return;
+    cleanupExpiredStates();
 
-    // Check if user is editing a field (tenant already resolved when photo was sent)
+    // Check if user is answering the URL propina prompt
     const state = conversationState.get(chatId);
-    if (state?.editingField) {
+    if (state?.kind === 'url-propina') {
+      const text = ctx.message.text?.trim() || '';
+
+      if (!isStateOwner(ctx, state)) {
+        await ctx.reply('Hay una factura pendiente de otro usuario\\. Esa persona debe confirmarla o cancelarla\\.', { parse_mode: 'MarkdownV2' });
+        return;
+      }
+
+      if (text === '/cancel') {
+        conversationState.delete(chatId);
+        await ctx.reply('❌ Operación cancelada\\.', { parse_mode: 'MarkdownV2' });
+        return;
+      }
+
+      if (state.awaitingPropinaAmount) {
+        const propina = parseAmountInput(text);
+        if (propina === null) {
+          await ctx.reply('❌ Valor inválido para Propina\\. Ingresa un monto, por ejemplo 120\\.00, o escribe /cancel\\.', { parse_mode: 'MarkdownV2' });
+          return;
+        }
+        if (propina > state.invoice.montoTotal) {
+          await ctx.reply('❌ La propina no puede ser mayor que el total de la factura\\. Intenta de nuevo o escribe /cancel\\.', { parse_mode: 'MarkdownV2' });
+          return;
+        }
+
+        state.invoice.propina = propina;
+        state.awaitingPropinaAmount = false;
+        await processUrlInvoice(ctx, chatId, env);
+        return;
+      }
+
+      await ctx.reply('Responde si esta factura tiene propina usando los botones\\.', {
+        parse_mode: 'MarkdownV2',
+        reply_markup: state.readyToRetry ? getUrlRetryKeyboard() : getUrlPropinaKeyboard(),
+      });
+      return;
+    }
+
+    // Check if user is editing a photo invoice field
+    if (state?.kind === 'photo' && state.editingField) {
       const fieldIndex = parseInt(state.editingField, 10);
       const text = ctx.message.text?.trim();
+
+      if (!isStateOwner(ctx, state)) {
+        await ctx.reply('Hay una factura pendiente de otro usuario\\. Esa persona debe confirmarla o cancelarla\\.', { parse_mode: 'MarkdownV2' });
+        return;
+      }
 
       // Check for /cancel command
       if (text === '/cancel') {
         state.editingField = undefined;
         await ctx.reply('✏️ Edición cancelada\\.', { parse_mode: 'MarkdownV2' });
-        await ctx.reply(formatConfirmationMessage(state.data), {
+        const confirmation = await ctx.reply(formatConfirmationMessage(state.data), {
           parse_mode: 'MarkdownV2',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '[1] Editar RNC Emisor', callback_data: 'edit:1' },
-                { text: '[2] Editar NCF/ENCF', callback_data: 'edit:2' },
-              ],
-              [
-                { text: '[3] Editar Fecha', callback_data: 'edit:3' },
-                { text: '[4] Editar ITBIS', callback_data: 'edit:4' },
-              ],
-              [
-                { text: 'Editar Total', callback_data: 'edit:5' },
-              ],
-              [
-                { text: '✅ Todo Correcto', callback_data: 'confirm' },
-                { text: '❌ Cancelar', callback_data: 'cancel' },
-              ],
-            ],
-          },
+          reply_markup: getPhotoConfirmationKeyboard(),
         });
+        state.promptMessageId = confirmation.message_id;
         return;
       }
 
       // Validate and update field
       const validation = validateFieldInput(fieldIndex, text || '');
       if (validation.valid && validation.parsedValue !== undefined) {
+        if (fieldIndex === 4) {
+          const total = extractNumericValue(state.data.montoTotal);
+          const propina = validation.parsedValue as number;
+          if (total !== null && propina > total) {
+            await ctx.reply('❌ La propina no puede ser mayor que el total de la factura\\. Por favor intenta de nuevo o escribe /cancel para abortar\\.', { parse_mode: 'MarkdownV2' });
+            return;
+          }
+        }
+
         // Update the data
         switch (fieldIndex) {
           case 1:
@@ -665,39 +860,25 @@ function getBot(env: Env): Bot {
             state.data.fechaEmision = validation.parsedValue as string;
             break;
           case 4:
-            state.data.itbis = validation.parsedValue as number;
+            state.data.propina = validation.parsedValue as number;
             break;
           case 5:
+            state.data.itbis = validation.parsedValue as number;
+            break;
+          case 6:
             state.data.montoTotal = validation.parsedValue as number;
             break;
         }
 
         state.editingField = undefined;
         await ctx.reply('✅ Campo actualizado\\.', { parse_mode: 'MarkdownV2' });
-        await ctx.reply(formatConfirmationMessage(state.data), {
+        const confirmation = await ctx.reply(formatConfirmationMessage(state.data), {
           parse_mode: 'MarkdownV2',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '[1] Editar RNC Emisor', callback_data: 'edit:1' },
-                { text: '[2] Editar NCF/ENCF', callback_data: 'edit:2' },
-              ],
-              [
-                { text: '[3] Editar Fecha', callback_data: 'edit:3' },
-                { text: '[4] Editar ITBIS', callback_data: 'edit:4' },
-              ],
-              [
-                { text: 'Editar Total', callback_data: 'edit:5' },
-              ],
-              [
-                { text: '✅ Todo Correcto', callback_data: 'confirm' },
-                { text: '❌ Cancelar', callback_data: 'cancel' },
-              ],
-            ],
-          },
+          reply_markup: getPhotoConfirmationKeyboard(),
         });
+        state.promptMessageId = confirmation.message_id;
       } else {
-        await ctx.reply(`❌ Valor inválido para ${getFieldLabel(fieldIndex)}\\. Por favor intenta de nuevo o escribe /cancel para abortar\\.`);
+        await ctx.reply(`❌ Valor inválido para ${getFieldLabel(fieldIndex)}\\. Por favor intenta de nuevo o escribe /cancel para abortar\\.`, { parse_mode: 'MarkdownV2' });
       }
       return;
     }
@@ -757,17 +938,62 @@ function getBot(env: Env): Bot {
       await ctx.answerCallbackQuery({ text: 'Sesión expirada. Por favor envía la foto nuevamente.' });
       return;
     }
+    if (state && !isStateOwner(ctx, state)) {
+      await ctx.answerCallbackQuery({ text: 'Solo quien inició esta factura puede responder.' });
+      return;
+    }
+    if (state && !isCurrentPrompt(ctx, state)) {
+      await ctx.answerCallbackQuery({ text: 'Este botón ya no corresponde a la factura activa.' });
+      return;
+    }
 
     if (data === 'confirm') {
+      if (state?.kind !== 'photo') {
+        await ctx.answerCallbackQuery({ text: 'Acción no válida para esta factura' });
+        return;
+      }
       await ctx.answerCallbackQuery();
       await processConfirmedInvoice(ctx, chatId, env);
     } else if (data === 'cancel') {
       conversationState.delete(chatId);
       await ctx.answerCallbackQuery();
       await ctx.reply('❌ Operación cancelada\\.', { parse_mode: 'MarkdownV2' });
+    } else if (data === 'propina:no') {
+      if (state?.kind !== 'url-propina') {
+        await ctx.answerCallbackQuery({ text: 'Acción no válida para esta factura' });
+        return;
+      }
+      if (state.processing) {
+        await ctx.answerCallbackQuery({ text: 'La factura ya se está guardando.' });
+        return;
+      }
+      state.invoice.propina = 0;
+      await ctx.answerCallbackQuery();
+      await processUrlInvoice(ctx, chatId, env);
+    } else if (data === 'propina:yes') {
+      if (state?.kind !== 'url-propina') {
+        await ctx.answerCallbackQuery({ text: 'Acción no válida para esta factura' });
+        return;
+      }
+      state.awaitingPropinaAmount = true;
+      state.readyToRetry = false;
+      state.promptMessageId = -1;
+      await ctx.answerCallbackQuery();
+      await ctx.reply('Ingresa el monto de la propina \\(por ejemplo 120\\.00\\) o escribe /cancel\\.', { parse_mode: 'MarkdownV2' });
+    } else if (data === 'propina:retry') {
+      if (state?.kind !== 'url-propina' || !state.readyToRetry) {
+        await ctx.answerCallbackQuery({ text: 'Acción no válida para esta factura' });
+        return;
+      }
+      await ctx.answerCallbackQuery();
+      await processUrlInvoice(ctx, chatId, env);
     } else if (data?.startsWith('edit:')) {
+      if (state?.kind !== 'photo') {
+        await ctx.answerCallbackQuery({ text: 'Acción no válida para esta factura' });
+        return;
+      }
       const fieldIndex = parseInt(data.split(':')[1], 10);
-      state!.editingField = fieldIndex.toString();
+      state.editingField = fieldIndex.toString();
       await ctx.answerCallbackQuery();
       await ctx.reply(`✏️ Ingresa el nuevo valor para *${getFieldLabel(fieldIndex)}* \\(o escribe /cancel para abortar\\):`, { parse_mode: 'MarkdownV2' });
     } else {

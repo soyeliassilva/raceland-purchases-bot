@@ -8,11 +8,16 @@ const SCOPES = [
 ];
 
 const HEADER_ROW = [
+  'Fecha', 'Estado', 'ENCF', 'RNC Vendedor', 'Nombre Vendedor', 'Propina', 'ITBIS', 'Total', 'URL', 'Añadido Por', 'Añadido El',
+];
+
+const LEGACY_HEADER_ROW = [
   'Fecha', 'Estado', 'ENCF', 'RNC Vendedor', 'Nombre Vendedor', 'ITBIS', 'Total', 'URL', 'Añadido Por', 'Añadido El',
 ];
 
 // Token cache (module-level, persists within single Worker invocation)
 let cachedToken: { token: string; expiresAt: number } | null = null;
+const migrationPromises = new Map<string, Promise<void>>();
 
 /**
  * Create AbortSignal with timeout
@@ -21,6 +26,20 @@ function createTimeoutSignal(ms: number): AbortSignal {
   const controller = new AbortController();
   setTimeout(() => controller.abort(), ms);
   return controller.signal;
+}
+
+function headerIndex(headers: string[], name: string): number {
+  return headers.findIndex((header) => header.trim().toLowerCase() === name.toLowerCase());
+}
+
+function normalizeHeaders(headers: string[]): string[] {
+  return headers.map((header) => header.trim());
+}
+
+function headersMatch(headers: string[], expected: string[]): boolean {
+  const normalized = normalizeHeaders(headers);
+  return normalized.length === expected.length
+    && expected.every((header, index) => normalized[index] === header);
 }
 
 /**
@@ -230,6 +249,115 @@ export async function getOrCreateSpreadsheet(
   return spreadsheetId;
 }
 
+async function ensurePropinaColumn(
+  spreadsheetId: string,
+  sheetName: string,
+  sheetId: number,
+  accessToken: string
+): Promise<void> {
+  const migrationKey = `${spreadsheetId}:${sheetId}`;
+  const existingMigration = migrationPromises.get(migrationKey);
+  if (existingMigration) {
+    await existingMigration;
+    return;
+  }
+
+  const migration = ensurePropinaColumnInternal(spreadsheetId, sheetName, sheetId, accessToken);
+  migrationPromises.set(migrationKey, migration);
+  try {
+    await migration;
+  } finally {
+    migrationPromises.delete(migrationKey);
+  }
+}
+
+async function ensurePropinaColumnInternal(
+  spreadsheetId: string,
+  sheetName: string,
+  sheetId: number,
+  accessToken: string
+): Promise<void> {
+  const headerResponse = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!1:1`,
+    {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
+    }
+  );
+
+  if (!headerResponse.ok) {
+    throw new Error(`Header fetch failed: ${headerResponse.status}`);
+  }
+
+  const headerData = await headerResponse.json() as { values?: string[][] };
+  const headers = headerData.values?.[0] || [];
+  const itbisIndex = headerIndex(headers, 'ITBIS');
+
+  if (headersMatch(headers, HEADER_ROW)) {
+    return;
+  }
+
+  if (!headersMatch(headers, LEGACY_HEADER_ROW)) {
+    throw new Error(`Sheet ${sheetName} has an unrecognized header shape`);
+  }
+
+  if (itbisIndex === -1) {
+    throw new Error(`Sheet ${sheetName} is missing ITBIS header`);
+  }
+
+  const insertResponse = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}:batchUpdate`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        requests: [
+          {
+            insertDimension: {
+              range: {
+                sheetId,
+                dimension: 'COLUMNS',
+                startIndex: itbisIndex,
+                endIndex: itbisIndex + 1,
+              },
+              inheritFromBefore: true,
+            },
+          },
+          {
+            updateCells: {
+              range: {
+                sheetId,
+                startRowIndex: 0,
+                endRowIndex: 1,
+                startColumnIndex: itbisIndex,
+                endColumnIndex: itbisIndex + 1,
+              },
+              rows: [
+                {
+                  values: [
+                    {
+                      userEnteredValue: { stringValue: 'Propina' },
+                    },
+                  ],
+                },
+              ],
+              fields: 'userEnteredValue',
+            },
+          },
+        ],
+      }),
+      signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
+    }
+  );
+
+  if (!insertResponse.ok) {
+    throw new Error(`Propina column insertion failed: ${insertResponse.status}`);
+  }
+}
+
 /**
  * Get or create sheet for the given month
  */
@@ -257,11 +385,31 @@ export async function getOrCreateSheet(
     sheets: Array<{ properties: { title: string; sheetId: number } }>;
   };
 
+  const mayoSheet = metaData.sheets?.find((s) => s.properties.title === 'Mayo');
+  if (mayoSheet && monthName !== 'Mayo') {
+    try {
+      await ensurePropinaColumn(
+        spreadsheetId,
+        'Mayo',
+        mayoSheet.properties.sheetId,
+        accessToken
+      );
+    } catch (error) {
+      console.error('Mayo Propina migration failed:', error);
+    }
+  }
+
   // Check if sheet exists
   const existingSheet = metaData.sheets?.find(
     (s) => s.properties.title === monthName
   );
   if (existingSheet) {
+    await ensurePropinaColumn(
+      spreadsheetId,
+      monthName,
+      existingSheet.properties.sheetId,
+      accessToken
+    );
     return monthName;
   }
 
@@ -369,6 +517,7 @@ export async function appendRow(
       row.encf,
       row.vendorRnc,
       row.vendorName,
+      row.propina,
       row.itbis,
       row.total,
       row.url,
@@ -378,7 +527,7 @@ export async function appendRow(
   ];
 
   const response = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!A:J:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!A:K:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
     {
       method: 'POST',
       headers: {
@@ -403,9 +552,8 @@ export async function getMonthTotals(
   sheetName: string,
   accessToken: string
 ): Promise<{ totalItbis: number; totalAmount: number; rowCount: number } | null> {
-  // Read columns F (ITBIS) and G (Total), skipping header row
   const response = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!F2:G`,
+    `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!A:K`,
     {
       headers: { Authorization: `Bearer ${accessToken}` },
       signal: createTimeoutSignal(FETCH_TIMEOUT_MS),
@@ -421,17 +569,25 @@ export async function getMonthTotals(
   }
 
   const data = await response.json() as { values?: string[][] };
-  if (!data.values || data.values.length === 0) {
+  if (!data.values || data.values.length <= 1) {
     return { totalItbis: 0, totalAmount: 0, rowCount: 0 };
+  }
+
+  const headers = data.values[0] || [];
+  const itbisIndex = headerIndex(headers, 'ITBIS');
+  const totalIndex = headerIndex(headers, 'Total');
+
+  if (itbisIndex === -1 || totalIndex === -1) {
+    throw new Error(`Sheet ${sheetName} is missing ITBIS or Total header`);
   }
 
   let totalItbis = 0;
   let totalAmount = 0;
   let rowCount = 0;
 
-  for (const row of data.values) {
-    const itbisVal = row[0] ? parseFloat(row[0]) : 0;
-    const totalVal = row[1] ? parseFloat(row[1]) : 0;
+  for (const row of data.values.slice(1)) {
+    const itbisVal = row[itbisIndex] ? parseFloat(row[itbisIndex]) : 0;
+    const totalVal = row[totalIndex] ? parseFloat(row[totalIndex]) : 0;
 
     if (!isNaN(totalVal) && totalVal > 0) {
       rowCount++;
@@ -449,6 +605,38 @@ export async function getMonthTotals(
     totalAmount: Math.round(totalAmount * 100) / 100,
     rowCount,
   };
+}
+
+export async function invoiceExists(
+  invoice: Invoice,
+  env: Env,
+  spreadsheetFolderId?: string
+): Promise<boolean> {
+  const accessToken = await getAccessToken(
+    env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    env.GOOGLE_PRIVATE_KEY
+  );
+
+  const year = invoice.fechaEmision.getUTCFullYear();
+  const monthIndex = invoice.fechaEmision.getUTCMonth();
+  const spreadsheetId = await findSpreadsheet(
+    year,
+    accessToken,
+    spreadsheetFolderId || env.SPREADSHEET_FOLDER_ID
+  );
+
+  if (!spreadsheetId) {
+    return false;
+  }
+
+  const sheetName = MONTH_NAMES[monthIndex];
+  return isDuplicateWithRnc(
+    spreadsheetId,
+    sheetName,
+    invoice.rncEmisor,
+    invoice.encf,
+    accessToken
+  );
 }
 
 /**
@@ -544,6 +732,7 @@ export async function addInvoiceToSheet(
     encf: invoice.encf,
     vendorRnc: invoice.rncEmisor,
     vendorName: vendorName || invoice.rncEmisor, // Fallback to RNC if no name
+    propina: invoice.propina.toFixed(2),
     itbis: invoice.itbis !== null ? invoice.itbis.toFixed(2) : '',
     total: invoice.montoTotal.toFixed(2),
     url: driveUrl || invoice.originalUrl, // Use Drive URL for photos, DGII URL for URLs
