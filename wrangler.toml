@@ -2,6 +2,10 @@ name = "dgii-purchase-tracker"
 main = "src/index.ts"
 compatibility_date = "2024-01-15"
 
+[[kv_namespaces]]
+binding = "CONVERSATION_STATE"
+id = "488338031c444415a19e4b955fd96321"
+
 [triggers]
 crons = ["0 8 * * *"]
 

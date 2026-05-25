@@ -62,7 +62,7 @@ type PhotoConversationState = {
   userId?: number;
   promptMessageId?: number;
   editingField?: string;
-  photoBuffer: ArrayBuffer;
+  photoBufferBase64: string; // base64-encoded for KV storage
   tenant: TenantConfig;
 };
 
@@ -81,11 +81,47 @@ type UrlPropinaConversationState = {
 
 type ConversationState = PhotoConversationState | UrlPropinaConversationState;
 
-// Conversation state for photo confirmation and URL propina prompts
-const conversationState = new Map<string, ConversationState>();
+// Session timeout in seconds (5 minutes) — used as KV expirationTtl
+const SESSION_TIMEOUT_SEC = 5 * 60;
 
-// Session timeout (5 minutes)
-const SESSION_TIMEOUT_MS = 5 * 60 * 1000;
+// KV helpers for conversation state persistence
+function kvKey(chatId: string): string {
+  return `conv:${chatId}`;
+}
+
+async function getState(kv: KVNamespace, chatId: string): Promise<ConversationState | null> {
+  return kv.get<ConversationState>(kvKey(chatId), 'json');
+}
+
+async function setState(kv: KVNamespace, chatId: string, state: ConversationState): Promise<void> {
+  await kv.put(kvKey(chatId), JSON.stringify(state), { expirationTtl: SESSION_TIMEOUT_SEC });
+}
+
+async function deleteState(kv: KVNamespace, chatId: string): Promise<void> {
+  await kv.delete(kvKey(chatId));
+}
+
+async function hasState(kv: KVNamespace, chatId: string): Promise<boolean> {
+  return (await kv.get(kvKey(chatId))) !== null;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(base64: string): ArrayBuffer {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
 
 /**
  * Get display name for user
@@ -337,17 +373,7 @@ function validateFieldInput(fieldIndex: number, value: string): { valid: boolean
   }
 }
 
-/**
- * Clean up expired conversation states
- */
-function cleanupExpiredStates(): void {
-  const now = Date.now();
-  for (const [chatId, state] of conversationState.entries()) {
-    if (now - state.timestamp > SESSION_TIMEOUT_MS) {
-      conversationState.delete(chatId);
-    }
-  }
-}
+// KV expiration handles cleanup automatically — no manual cleanup needed
 
 /**
  * Handle photo upload and OCR extraction
@@ -357,10 +383,7 @@ async function handlePhotoUpload(ctx: Context, env: Env, tenant: TenantConfig): 
   if (!chatId) return;
 
   try {
-    // Clean up expired states first
-    cleanupExpiredStates();
-
-    if (conversationState.has(chatId)) {
+    if (await hasState(env.CONVERSATION_STATE, chatId)) {
       await ctx.reply('Hay una factura pendiente en este chat\\. Confírmala o cancélala antes de enviar otra\\.', { parse_mode: 'MarkdownV2' });
       return;
     }
@@ -415,15 +438,15 @@ async function handlePhotoUpload(ctx: Context, env: Env, tenant: TenantConfig): 
       }
     }
 
-    // Store conversation state (including tenant for later use in confirmation)
-    conversationState.set(chatId, {
+    // Store conversation state in KV (photo encoded as base64)
+    const state: PhotoConversationState = {
       kind: 'photo',
       data: extractedData,
       timestamp: Date.now(),
       userId: ctx.from?.id,
-      photoBuffer,
+      photoBufferBase64: arrayBufferToBase64(photoBuffer),
       tenant,
-    });
+    };
 
     const message = formatConfirmationMessage(extractedData);
 
@@ -431,10 +454,8 @@ async function handlePhotoUpload(ctx: Context, env: Env, tenant: TenantConfig): 
       parse_mode: 'MarkdownV2',
       reply_markup: getPhotoConfirmationKeyboard(),
     });
-    const state = conversationState.get(chatId);
-    if (state?.kind === 'photo') {
-      state.promptMessageId = confirmation.message_id;
-    }
+    state.promptMessageId = confirmation.message_id;
+    await setState(env.CONVERSATION_STATE, chatId, state);
   } catch (error) {
     const errorMsg = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     console.error('Error handling photo upload:', errorMsg);
@@ -442,7 +463,7 @@ async function handlePhotoUpload(ctx: Context, env: Env, tenant: TenantConfig): 
       console.error('Stack:', error.stack);
     }
     await ctx.reply('❌ Ocurrió un error al procesar la foto\\. Por favor intenta de nuevo\\.', { parse_mode: 'MarkdownV2' });
-    conversationState.delete(chatId);
+    await deleteState(env.CONVERSATION_STATE, chatId);
   }
 }
 
@@ -450,10 +471,11 @@ async function handlePhotoUpload(ctx: Context, env: Env, tenant: TenantConfig): 
  * Process confirmed invoice data (upload to Drive and save to Sheets)
  */
 async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): Promise<void> {
-  const state = conversationState.get(chatId);
+  const state = await getState(env.CONVERSATION_STATE, chatId);
   if (!state || state.kind !== 'photo') return;
 
-  const { data, photoBuffer, tenant } = state;
+  const { data, photoBufferBase64, tenant } = state;
+  const photoBuffer = base64ToArrayBuffer(photoBufferBase64);
 
   try {
     // Require seller RNC for duplicate detection
@@ -550,12 +572,12 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
     console.error('Error processing confirmed invoice:', error);
     await ctx.reply('❌ Ocurrió un error al guardar la factura\\. Por favor intenta de nuevo\\.', { parse_mode: 'MarkdownV2' });
   } finally {
-    conversationState.delete(chatId);
+    await deleteState(env.CONVERSATION_STATE, chatId);
   }
 }
 
 async function processUrlInvoice(ctx: Context, chatId: string, env: Env): Promise<void> {
-  const state = conversationState.get(chatId);
+  const state = await getState(env.CONVERSATION_STATE, chatId);
   if (!state || state.kind !== 'url-propina') return;
   if (state.processing) return;
 
@@ -573,7 +595,7 @@ async function processUrlInvoice(ctx: Context, chatId: string, env: Env): Promis
 
     if (sheetResult === 'duplicate') {
       await ctx.reply(formatDuplicateMessage(state.invoice.encf), { parse_mode: 'MarkdownV2' });
-      conversationState.delete(chatId);
+      await deleteState(env.CONVERSATION_STATE, chatId);
       return;
     }
 
@@ -582,7 +604,7 @@ async function processUrlInvoice(ctx: Context, chatId: string, env: Env): Promis
     } else {
       await ctx.reply(formatSuccessMessage(state.invoice), { parse_mode: 'MarkdownV2' });
     }
-    conversationState.delete(chatId);
+    await deleteState(env.CONVERSATION_STATE, chatId);
   } catch (error) {
     console.error('Error processing URL invoice:', error);
     state.processing = false;
@@ -592,6 +614,7 @@ async function processUrlInvoice(ctx: Context, chatId: string, env: Env): Promis
       reply_markup: getUrlRetryKeyboard(),
     });
     state.promptMessageId = retryPrompt.message_id;
+    await setState(env.CONVERSATION_STATE, chatId, state);
   }
 }
 
@@ -606,9 +629,8 @@ async function handleDgiiUrl(
 ): Promise<void> {
   const chatId = ctx.chat?.id?.toString();
   if (!chatId) return;
-  cleanupExpiredStates();
 
-  if (conversationState.has(chatId)) {
+  if (await hasState(env.CONVERSATION_STATE, chatId)) {
     await ctx.reply('Hay una factura pendiente en este chat\\. Confírmala o cancélala antes de enviar otra\\.', { parse_mode: 'MarkdownV2' });
     return;
   }
@@ -640,22 +662,20 @@ async function handleDgiiUrl(
     return;
   }
 
-  conversationState.set(chatId, {
+  const state: UrlPropinaConversationState = {
     kind: 'url-propina',
     invoice: { ...result, propina: 0 },
     timestamp: Date.now(),
     userId: ctx.from?.id,
     tenant,
     username,
-  });
+  };
 
   const prompt = await ctx.reply('¿Esta factura tiene propina?', {
     reply_markup: getUrlPropinaKeyboard(),
   });
-  const state = conversationState.get(chatId);
-  if (state?.kind === 'url-propina') {
-    state.promptMessageId = prompt.message_id;
-  }
+  state.promptMessageId = prompt.message_id;
+  await setState(env.CONVERSATION_STATE, chatId, state);
 }
 
 /**
@@ -772,10 +792,9 @@ function getBot(env: Env): Bot {
     console.log(`Message received from chat: ${chatId}`);
 
     if (!chatId) return;
-    cleanupExpiredStates();
 
     // Check if user is answering the URL propina prompt
-    const state = conversationState.get(chatId);
+    const state = await getState(env.CONVERSATION_STATE, chatId);
     if (state?.kind === 'url-propina') {
       const text = ctx.message.text?.trim() || '';
 
@@ -785,7 +804,7 @@ function getBot(env: Env): Bot {
       }
 
       if (text === '/cancel') {
-        conversationState.delete(chatId);
+        await deleteState(env.CONVERSATION_STATE, chatId);
         await ctx.reply('❌ Operación cancelada\\.', { parse_mode: 'MarkdownV2' });
         return;
       }
@@ -803,6 +822,7 @@ function getBot(env: Env): Bot {
 
         state.invoice.propina = propina;
         state.awaitingPropinaAmount = false;
+        await setState(env.CONVERSATION_STATE, chatId, state);
         await processUrlInvoice(ctx, chatId, env);
         return;
       }
@@ -833,6 +853,7 @@ function getBot(env: Env): Bot {
           reply_markup: getPhotoConfirmationKeyboard(),
         });
         state.promptMessageId = confirmation.message_id;
+        await setState(env.CONVERSATION_STATE, chatId, state);
         return;
       }
 
@@ -877,6 +898,7 @@ function getBot(env: Env): Bot {
           reply_markup: getPhotoConfirmationKeyboard(),
         });
         state.promptMessageId = confirmation.message_id;
+        await setState(env.CONVERSATION_STATE, chatId, state);
       } else {
         await ctx.reply(`❌ Valor inválido para ${getFieldLabel(fieldIndex)}\\. Por favor intenta de nuevo o escribe /cancel para abortar\\.`, { parse_mode: 'MarkdownV2' });
       }
@@ -928,10 +950,7 @@ function getBot(env: Env): Bot {
     const chatId = ctx.callbackQuery?.message?.chat.id.toString();
     if (!chatId) return;
 
-    // Clean up expired states
-    cleanupExpiredStates();
-
-    const state = conversationState.get(chatId);
+    const state = await getState(env.CONVERSATION_STATE, chatId);
     const data = ctx.callbackQuery.data;
 
     if (!state && data !== 'cancel') {
@@ -955,7 +974,7 @@ function getBot(env: Env): Bot {
       await ctx.answerCallbackQuery();
       await processConfirmedInvoice(ctx, chatId, env);
     } else if (data === 'cancel') {
-      conversationState.delete(chatId);
+      await deleteState(env.CONVERSATION_STATE, chatId);
       await ctx.answerCallbackQuery();
       await ctx.reply('❌ Operación cancelada\\.', { parse_mode: 'MarkdownV2' });
     } else if (data === 'propina:no') {
@@ -968,6 +987,7 @@ function getBot(env: Env): Bot {
         return;
       }
       state.invoice.propina = 0;
+      await setState(env.CONVERSATION_STATE, chatId, state);
       await ctx.answerCallbackQuery();
       await processUrlInvoice(ctx, chatId, env);
     } else if (data === 'propina:yes') {
@@ -978,6 +998,7 @@ function getBot(env: Env): Bot {
       state.awaitingPropinaAmount = true;
       state.readyToRetry = false;
       state.promptMessageId = -1;
+      await setState(env.CONVERSATION_STATE, chatId, state);
       await ctx.answerCallbackQuery();
       await ctx.reply('Ingresa el monto de la propina \\(por ejemplo 120\\.00\\) o escribe /cancel\\.', { parse_mode: 'MarkdownV2' });
     } else if (data === 'propina:retry') {
@@ -994,6 +1015,7 @@ function getBot(env: Env): Bot {
       }
       const fieldIndex = parseInt(data.split(':')[1], 10);
       state.editingField = fieldIndex.toString();
+      await setState(env.CONVERSATION_STATE, chatId, state);
       await ctx.answerCallbackQuery();
       await ctx.reply(`✏️ Ingresa el nuevo valor para *${getFieldLabel(fieldIndex)}* \\(o escribe /cancel para abortar\\):`, { parse_mode: 'MarkdownV2' });
     } else {

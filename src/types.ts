@@ -127,6 +127,7 @@ export interface Env {
   BUYER_RNC?: string; // Hardcoded buyer RNC for validation (photo invoices)
   TENANTS_CONFIG?: string; // JSON mapping chat IDs to TenantConfig (multi-tenant mode)
   AI: Ai; // Cloudflare Workers AI binding
+  CONVERSATION_STATE: KVNamespace; // KV namespace for persisting conversation state across requests
 }
 
 /**
