@@ -90,7 +90,12 @@ function kvKey(chatId: string): string {
 }
 
 async function getState(kv: KVNamespace, chatId: string): Promise<ConversationState | null> {
-  return kv.get<ConversationState>(kvKey(chatId), 'json');
+  const state = await kv.get<ConversationState>(kvKey(chatId), 'json');
+  // Rehydrate Date objects lost during JSON serialization
+  if (state?.kind === 'url-propina' && typeof state.invoice.fechaEmision === 'string') {
+    state.invoice.fechaEmision = new Date(state.invoice.fechaEmision);
+  }
+  return state;
 }
 
 async function setState(kv: KVNamespace, chatId: string, state: ConversationState): Promise<void> {
