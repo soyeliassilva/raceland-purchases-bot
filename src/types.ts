@@ -73,6 +73,7 @@ export interface ExtractedInvoiceData {
   itbis?: number | string;
   montoTotal?: number | string;
   propina?: number | string;
+  propinaMismatch?: boolean;
   vendorName?: string;
 }
 

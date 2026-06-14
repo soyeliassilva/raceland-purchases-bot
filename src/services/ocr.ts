@@ -257,6 +257,23 @@ IMPORTANT:
       result.propina = 0;
     }
 
+    // Cross-check OCR propina against formula: propina = (total - itbis) / 11
+    if (
+      result.propina !== undefined && result.propina > 0 &&
+      normalizedTotal !== undefined &&
+      result.itbis !== undefined
+    ) {
+      const normalizedItbis = typeof result.itbis === 'number'
+        ? result.itbis
+        : parseNumber(result.itbis);
+      if (!isNaN(normalizedItbis)) {
+        const expectedPropina = Math.round(((normalizedTotal - normalizedItbis) / 11) * 100) / 100;
+        if (Math.abs(result.propina - expectedPropina) > 1.0) {
+          result.propinaMismatch = true;
+        }
+      }
+    }
+
     // Fix swapped RNCs: if the "seller" RNC matches the known buyer, swap them
     if (buyerRnc && result.rncEmisor === buyerRnc) {
       console.log(`RNC swap: rncEmisor (${result.rncEmisor}) matches buyer RNC, swapping with rncComprador (${result.rncComprador || 'empty'})`);

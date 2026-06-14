@@ -232,6 +232,9 @@ function formatConfirmationMessage(data: ExtractedInvoiceData): string {
       ? parseNumber(String(data.propina))
       : 0;
   lines.push(`💵 Propina: RD\\$${escapeMarkdown(propina.toFixed(2))}`);
+  if (data.propinaMismatch) {
+    lines.push('⚠️ _La propina no coincide con el 10% esperado\\. Verifica con Editar Propina\\._');
+  }
   if (data.itbis !== undefined) {
     const itbisValue = typeof data.itbis === 'number' ? data.itbis : parseNumber(data.itbis);
     const itbisStr = itbisValue.toFixed(2);
@@ -815,6 +818,14 @@ function getBot(env: Env): Bot {
       }
 
       if (state.awaitingPropinaAmount) {
+        // Accept /ok to confirm auto-calculated propina
+        if (text === '/ok' && state.invoice.propina > 0) {
+          state.awaitingPropinaAmount = false;
+          await setState(env.CONVERSATION_STATE, chatId, state);
+          await processUrlInvoice(ctx, chatId, env);
+          return;
+        }
+
         const propina = parseAmountInput(text);
         if (propina === null) {
           await ctx.reply('❌ Valor inválido para Propina\\. Ingresa un monto, por ejemplo 120\\.00, o escribe /cancel\\.', { parse_mode: 'MarkdownV2' });
@@ -887,6 +898,7 @@ function getBot(env: Env): Bot {
             break;
           case 4:
             state.data.propina = validation.parsedValue as number;
+            state.data.propinaMismatch = false;
             break;
           case 5:
             state.data.itbis = validation.parsedValue as number;
@@ -1000,12 +1012,42 @@ function getBot(env: Env): Bot {
         await ctx.answerCallbackQuery({ text: 'Acción no válida para esta factura' });
         return;
       }
-      state.awaitingPropinaAmount = true;
-      state.readyToRetry = false;
-      state.promptMessageId = -1;
-      await setState(env.CONVERSATION_STATE, chatId, state);
+      if (state.processing) {
+        await ctx.answerCallbackQuery({ text: 'La factura ya se está guardando.' });
+        return;
+      }
       await ctx.answerCallbackQuery();
-      await ctx.reply('Ingresa el monto de la propina \\(por ejemplo 120\\.00\\) o escribe /cancel\\.', { parse_mode: 'MarkdownV2' });
+
+      // Auto-calculate propina when ITBIS is available
+      if (state.invoice.itbis !== null && !isNaN(state.invoice.itbis)) {
+        const propina = Math.round(((state.invoice.montoTotal - state.invoice.itbis) / 11) * 100) / 100;
+        if (propina <= 0) {
+          // Bad data (itbis >= total) — fall back to manual input
+          state.awaitingPropinaAmount = true;
+          state.readyToRetry = false;
+          state.promptMessageId = -1;
+          await setState(env.CONVERSATION_STATE, chatId, state);
+          await ctx.reply('Ingresa el monto de la propina \\(por ejemplo 120\\.00\\) o escribe /cancel\\.', { parse_mode: 'MarkdownV2' });
+          return;
+        }
+        state.invoice.propina = propina;
+        state.awaitingPropinaAmount = true;
+        state.readyToRetry = false;
+        state.promptMessageId = -1;
+        await setState(env.CONVERSATION_STATE, chatId, state);
+        const escapedPropina = escapeMarkdown(propina.toFixed(2));
+        await ctx.reply(
+          `💵 Propina calculada: RD\\$${escapedPropina}\n\nEscribe un monto diferente para corregir, o /ok para confirmar\\.`,
+          { parse_mode: 'MarkdownV2' }
+        );
+      } else {
+        // ITBIS pending — fall back to manual input
+        state.awaitingPropinaAmount = true;
+        state.readyToRetry = false;
+        state.promptMessageId = -1;
+        await setState(env.CONVERSATION_STATE, chatId, state);
+        await ctx.reply('Ingresa el monto de la propina \\(por ejemplo 120\\.00\\) o escribe /cancel\\.', { parse_mode: 'MarkdownV2' });
+      }
     } else if (data === 'propina:retry') {
       if (state?.kind !== 'url-propina' || !state.readyToRetry) {
         await ctx.answerCallbackQuery({ text: 'Acción no válida para esta factura' });
