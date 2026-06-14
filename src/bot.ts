@@ -818,14 +818,6 @@ function getBot(env: Env): Bot {
       }
 
       if (state.awaitingPropinaAmount) {
-        // Accept /ok to confirm auto-calculated propina
-        if (text === '/ok' && state.invoice.propina > 0) {
-          state.awaitingPropinaAmount = false;
-          await setState(env.CONVERSATION_STATE, chatId, state);
-          await processUrlInvoice(ctx, chatId, env);
-          return;
-        }
-
         const propina = parseAmountInput(text);
         if (propina === null) {
           await ctx.reply('❌ Valor inválido para Propina\\. Ingresa un monto, por ejemplo 120\\.00, o escribe /cancel\\.', { parse_mode: 'MarkdownV2' });
@@ -1031,15 +1023,8 @@ function getBot(env: Env): Bot {
           return;
         }
         state.invoice.propina = propina;
-        state.awaitingPropinaAmount = true;
-        state.readyToRetry = false;
-        state.promptMessageId = -1;
         await setState(env.CONVERSATION_STATE, chatId, state);
-        const escapedPropina = escapeMarkdown(propina.toFixed(2));
-        await ctx.reply(
-          `💵 Propina calculada: RD\\$${escapedPropina}\n\nEscribe un monto diferente para corregir, o /ok para confirmar\\.`,
-          { parse_mode: 'MarkdownV2' }
-        );
+        await processUrlInvoice(ctx, chatId, env);
       } else {
         // ITBIS pending — fall back to manual input
         state.awaitingPropinaAmount = true;
