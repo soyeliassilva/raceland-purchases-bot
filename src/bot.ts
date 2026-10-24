@@ -4,7 +4,7 @@ import type { Env, Invoice, ExtractedInvoiceData, TenantConfig } from './types.j
 import { MONTH_NAMES } from './types.js';
 import { extractDgiiUrl, fetchInvoice, parseNumber, lookupRncName } from './services/dgii.js';
 import { addInvoiceToSheet, getAccessToken, findSpreadsheet, getMonthTotals, invoiceExists } from './services/sheets.js';
-import { extractInvoiceData, parseReceiptDate, OcrUnavailableError } from './services/ocr.js';
+import { extractInvoiceData, parseReceiptDate, classifyInvoiceDate, OcrUnavailableError } from './services/ocr.js';
 import { getOrCreateReceiptFolder, uploadReceiptImage } from './services/drive.js';
 
 // Bot instance cache (reuse across requests within same Worker instance)
@@ -226,6 +226,11 @@ function formatConfirmationMessage(data: ExtractedInvoiceData): string {
   }
   if (data.fechaEmision) {
     lines.push(`📅 Fecha: \`${data.fechaEmision}\``);
+    if (data.fechaBeforeLastMonth) {
+      lines.push('⚠️ _La fecha es anterior al mes pasado\\. Verifica con Editar Fecha\\._');
+    }
+  } else if (data.fechaRejectedFuture) {
+    lines.push(`⚠️ _La fecha leída \\(${escapeMarkdown(data.fechaRejectedFuture)}\\) está en el futuro\\. Corrígela con Editar Fecha\\._`);
   }
   const propina = typeof data.propina === 'number'
     ? data.propina
@@ -498,28 +503,33 @@ async function processConfirmedInvoice(ctx: Context, chatId: string, env: Env): 
   const { data, photoBufferBase64, tenant } = state;
   const photoBuffer = base64ToArrayBuffer(photoBufferBase64);
 
-  try {
-    // Require seller RNC for duplicate detection
-    if (!data.rncEmisor) {
-      await ctx.reply(
-        '⚠️ El RNC del emisor es obligatorio\\. Usa el botón *Editar RNC* para agregarlo\\.',
-        { parse_mode: 'MarkdownV2' }
-      );
-      return;
-    }
+  // Validate required fields before the try, whose finally deletes the state. On
+  // failure, KEEP the state and re-show the confirmation so the user can complete
+  // the missing fields via the Editar buttons. The seller RNC is needed for
+  // duplicate detection, and a date the OCR read in the future is left empty.
+  const fechaEmision = parseReceiptDate(data.fechaEmision || '');
+  if (!data.rncEmisor || !fechaEmision) {
+    const missing = [!data.rncEmisor ? 'RNC' : '', !fechaEmision ? 'Fecha' : ''].filter(Boolean).join(', ');
+    await ctx.reply(
+      `⚠️ Faltan datos obligatorios: ${escapeMarkdown(missing)}\\. Usa los botones para completarlos\\.`,
+      { parse_mode: 'MarkdownV2' }
+    );
+    const confirmation = await ctx.reply(formatConfirmationMessage(data), {
+      parse_mode: 'MarkdownV2',
+      reply_markup: getPhotoConfirmationKeyboard(),
+    });
+    state.promptMessageId = confirmation.message_id;
+    await setState(env.CONVERSATION_STATE, chatId, state);
+    return;
+  }
 
+  try {
     await ctx.reply('💾 Guardando la factura\\.\\.\\.', { parse_mode: 'MarkdownV2' });
 
     const accessToken = await getAccessToken(
       env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
       env.GOOGLE_PRIVATE_KEY
     );
-
-    // Parse date from extracted data
-    const fechaEmision = parseReceiptDate(data.fechaEmision || '');
-    if (!fechaEmision) {
-      throw new Error('Invalid invoice date');
-    }
 
     // Upload to Drive (use tenant-specific folder)
     const year = fechaEmision.getUTCFullYear();
@@ -888,6 +898,16 @@ function getBot(env: Env): Bot {
             await ctx.reply('❌ La propina no puede ser mayor que el total de la factura\\. Por favor intenta de nuevo o escribe /cancel para abortar\\.', { parse_mode: 'MarkdownV2' });
             return;
           }
+        }
+
+        if (fieldIndex === 3) {
+          const when = classifyInvoiceDate(parseReceiptDate(validation.parsedValue as string)!);
+          if (when === 'future') {
+            await ctx.reply('❌ La fecha no puede estar en el futuro\\. Por favor intenta de nuevo o escribe /cancel para abortar\\.', { parse_mode: 'MarkdownV2' });
+            return;
+          }
+          state.data.fechaBeforeLastMonth = when === 'old';
+          state.data.fechaRejectedFuture = undefined;
         }
 
         // Update the data

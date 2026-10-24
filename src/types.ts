@@ -74,6 +74,8 @@ export interface ExtractedInvoiceData {
   montoTotal?: number | string;
   propina?: number | string;
   propinaMismatch?: boolean;
+  fechaRejectedFuture?: string; // future date the OCR read, dropped from fechaEmision
+  fechaBeforeLastMonth?: boolean;
   vendorName?: string;
 }
 

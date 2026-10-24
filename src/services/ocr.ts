@@ -59,12 +59,13 @@ function detectInvoiceType(ncf: string): 'electronica' | 'papel' {
 /**
  * Parse date from various formats
  * Tries: DD-MM-YYYY, DD/MM/YYYY, YYYY-MM-DD, DD/MM/YY, DD-MM-YY
+ * Day and month may be one digit, and a printed time after the date is ignored.
  */
 export function parseReceiptDate(dateStr: string): Date | null {
   const formats = [
-    /^(\d{2})[-/](\d{2})[-/](\d{4})$/, // DD-MM-YYYY or DD/MM/YYYY
-    /^(\d{4})[-/](\d{2})[-/](\d{2})$/, // YYYY-MM-DD or YYYY/MM/DD
-    /^(\d{2})[-/](\d{2})[-/](\d{2})$/, // DD-MM-YY or DD/MM/YY
+    /^(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:\s.*)?$/, // DD-MM-YYYY or DD/MM/YYYY
+    /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:\s.*)?$/, // YYYY-MM-DD or YYYY/MM/DD
+    /^(\d{1,2})[-/](\d{1,2})[-/](\d{2})(?:\s.*)?$/, // DD-MM-YY or DD/MM/YY
   ];
 
   for (const format of formats) {
@@ -101,6 +102,23 @@ export function parseReceiptDate(dateStr: string): Date | null {
 
   console.error(`Could not parse date: ${dateStr}`);
   return null;
+}
+
+// Santo Domingo is UTC-4 all year, with no daylight saving
+const DOMINICAN_UTC_OFFSET_MS = -4 * 60 * 60 * 1000;
+
+/**
+ * Check an invoice date against the business rule: the bot records current
+ * expenses, so invoices come from this month or the previous one and never from
+ * the future. `date` is a calendar date at UTC midnight, as from `parseReceiptDate`.
+ */
+export function classifyInvoiceDate(date: Date, now: Date = new Date()): 'ok' | 'future' | 'old' {
+  const local = new Date(now.getTime() + DOMINICAN_UTC_OFFSET_MS);
+  const today = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate());
+  const firstOfLastMonth = Date.UTC(local.getUTCFullYear(), local.getUTCMonth() - 1, 1);
+  if (date.getTime() > today) return 'future';
+  if (date.getTime() < firstOfLastMonth) return 'old';
+  return 'ok';
 }
 
 /**
@@ -147,7 +165,7 @@ export async function extractInvoiceData(
   "rncEmisor": "seller/vendor RNC (usually at the top of the receipt, labeled RNC or near the business name)",
   "rncComprador": "buyer/client RNC (usually labeled RNC Comprador or Cliente)",
   "ncf": "NCF or ENCF number (starts with a letter like E or B)",
-  "fechaEmision": "invoice date in DD-MM-YYYY format",
+  "fechaEmision": "invoice date copied exactly as printed, in the same order and with the same separators (e.g. 16/10/26 or 21/10/2026)",
   "propina": "mandatory legal tip/service amount as number (look for Propina Legal, 10% de ley, Servicio Legal, or Ley 10%)",
   "itbis": "ITBIS tax amount as number",
   "montoTotal": "total amount as number"
@@ -159,7 +177,7 @@ IMPORTANT:
 - RNC numbers may contain dashes (e.g., 101-71926-5). Remove all dashes and return digits only (e.g., 101719265).
 - If a field cannot be read, use null for its value.
 - For the NCF/ENCF field, extract exactly as shown (ENCF starts with E, NCF starts with a letter).
-- For dates, always use DD-MM-YYYY format.
+- Copy the date exactly as printed, without the time. Do not reorder, convert or complete it.
 - For amounts, use numbers only (no currency symbols).
 - For propina, return the absolute money amount, not the percentage. If no legal tip/service line appears, return 0.`;
 
@@ -242,7 +260,15 @@ IMPORTANT:
         const day = parsedDate.getUTCDate().toString().padStart(2, '0');
         const month = (parsedDate.getUTCMonth() + 1).toString().padStart(2, '0');
         const year = parsedDate.getUTCFullYear();
-        result.fechaEmision = `${day}-${month}-${year}`;
+        const when = classifyInvoiceDate(parsedDate);
+        if (when === 'future') {
+          // Always a misread. Leave the date empty so it cannot be saved, and keep
+          // what was read so the user sees why they must enter it.
+          result.fechaRejectedFuture = `${day}-${month}-${year}`;
+        } else {
+          result.fechaEmision = `${day}-${month}-${year}`;
+          result.fechaBeforeLastMonth = when === 'old';
+        }
       }
     }
 
