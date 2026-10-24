@@ -1,12 +1,13 @@
+import type { Update } from 'grammy/types';
 import type { Env } from './types.js';
-import { createWebhookHandler } from './bot.js';
+import { processUpdate } from './bot.js';
 import { handleCron } from './handlers/cron.js';
 
 export default {
   /**
    * Handle incoming HTTP requests (Telegram webhook)
    */
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // Only accept POST requests
     if (request.method !== 'POST') {
       return new Response('Method not allowed', { status: 405 });
@@ -19,10 +20,12 @@ export default {
       return new Response('Unauthorized', { status: 401 });
     }
 
-    // Process webhook update
+    // Answer Telegram before doing any work. Telegram resends every update that
+    // is not answered 2xx in time, so slow OCR here made the bot loop.
     try {
-      const handler = createWebhookHandler(env);
-      return await handler(request);
+      const update = (await request.json()) as Update;
+      ctx.waitUntil(processUpdate(env, update));
+      return new Response('OK');
     } catch (error) {
       console.error('Error processing webhook:', error);
       return new Response('Internal server error', { status: 500 });

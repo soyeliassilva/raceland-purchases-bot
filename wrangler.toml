@@ -12,6 +12,11 @@ crons = ["0 8 * * *"]
 [ai]
 binding = "AI"
 
+# Workers Logs: keeps request logs (3 days on Free, 7 on Paid) so failures can be
+# investigated after the fact instead of only through a live `wrangler tail`.
+[observability]
+enabled = true
+
 [vars]
 # These are placeholders - set actual values via `wrangler secret put`
 # TELEGRAM_BOT_TOKEN = ""

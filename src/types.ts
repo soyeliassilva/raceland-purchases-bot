@@ -99,10 +99,12 @@ export interface AiInput {
   messages: AiMessage[];
   max_tokens?: number;
   temperature?: number;
+  chat_template_kwargs?: { enable_thinking?: boolean };
 }
 
 export interface AiResponse {
   response?: string | Record<string, unknown>;
+  choices?: { message?: { content?: string | null } }[];
 }
 
 /**

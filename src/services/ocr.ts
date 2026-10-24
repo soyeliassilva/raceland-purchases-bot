@@ -1,6 +1,26 @@
-import type { ExtractedInvoiceData, Ai } from '../types.js';
+import type { ExtractedInvoiceData, Ai, AiResponse } from '../types.js';
 
-const MODEL = '@cf/meta/llama-4-scout-17b-16e-instruct';
+// Replaced Llama 4 Scout in Oct 2026, when Workers AI slowed it past 10 s per call.
+// Thinking is switched off below: with it on, Gemma took 55+ s per receipt.
+const MODEL = '@cf/google/gemma-4-26b-a4b-it';
+
+// Gemma took 2-8 s on real receipts. The cap leaves room in Cloudflare's 30 s
+// background budget for the DGII lookup and Telegram replies that follow OCR.
+const OCR_TIMEOUT_MS = 20_000;
+
+/**
+ * The OCR model failed or did not answer in time. Distinct from a `null` result,
+ * which means the model answered but could not read the receipt.
+ */
+export class OcrUnavailableError extends Error {}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer!: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`no answer after ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 /**
  * Create AbortSignal with timeout
@@ -144,44 +164,52 @@ IMPORTANT:
 - For propina, return the absolute money amount, not the percentage. If no legal tip/service line appears, return 0.`;
 
     // Call Cloudflare Workers AI with OpenAI-compatible messages format
-    const response = await ai.run(MODEL, {
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'image_url',
-              image_url: {
-                url: `data:image/jpeg;base64,${base64Image}`,
+    let response: AiResponse;
+    try {
+      response = await withTimeout(ai.run(MODEL, {
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:image/jpeg;base64,${base64Image}`,
+                },
               },
-            },
-            {
-              type: 'text',
-              text: prompt,
-            },
-          ],
-        },
-      ],
-    });
+              {
+                type: 'text',
+                text: prompt,
+              },
+            ],
+          },
+        ],
+        chat_template_kwargs: { enable_thinking: false },
+      }), OCR_TIMEOUT_MS);
+    } catch (error) {
+      throw new OcrUnavailableError(error instanceof Error ? error.message : String(error));
+    }
 
     console.log('AI response received:', JSON.stringify(response).substring(0, 500));
 
-    if (!response.response) {
-      console.error('OCR AI call failed - no response field:', JSON.stringify(response));
+    // Gemma answers in OpenAI chat format, older models filled `response`
+    const content = response.choices?.[0]?.message?.content ?? response.response;
+    if (!content) {
+      console.error('OCR AI call failed - no content in response:', JSON.stringify(response));
       return null;
     }
 
-    // response.response can be a string or an already-parsed object
+    // content can be a string or an already-parsed object
     let extracted: ExtractedInvoiceData;
-    if (typeof response.response === 'string') {
-      let jsonText = response.response.trim();
+    if (typeof content === 'string') {
+      let jsonText = content.trim();
       // Remove markdown code blocks if present
       jsonText = jsonText.replace(/```json\n?/g, '').replace(/```\n?/g, '');
       console.log('OCR raw response (string):', jsonText);
       extracted = JSON.parse(jsonText) as ExtractedInvoiceData;
     } else {
-      console.log('OCR raw response (object):', JSON.stringify(response.response));
-      extracted = response.response as unknown as ExtractedInvoiceData;
+      console.log('OCR raw response (object):', JSON.stringify(content));
+      extracted = content as unknown as ExtractedInvoiceData;
     }
 
     // Validate and normalize extracted data
@@ -304,6 +332,7 @@ IMPORTANT:
     console.log('OCR extraction successful:', result);
     return result;
   } catch (error) {
+    if (error instanceof OcrUnavailableError) throw error;
     console.error('Error extracting invoice data:', error);
     return null;
   }

@@ -1,9 +1,10 @@
-import { Bot, Context, webhookCallback } from 'grammy';
+import { Bot, Context } from 'grammy';
+import type { Update } from 'grammy/types';
 import type { Env, Invoice, ExtractedInvoiceData, TenantConfig } from './types.js';
 import { MONTH_NAMES } from './types.js';
 import { extractDgiiUrl, fetchInvoice, parseNumber, lookupRncName } from './services/dgii.js';
 import { addInvoiceToSheet, getAccessToken, findSpreadsheet, getMonthTotals, invoiceExists } from './services/sheets.js';
-import { extractInvoiceData, parseReceiptDate } from './services/ocr.js';
+import { extractInvoiceData, parseReceiptDate, OcrUnavailableError } from './services/ocr.js';
 import { getOrCreateReceiptFolder, uploadReceiptImage } from './services/drive.js';
 
 // Bot instance cache (reuse across requests within same Worker instance)
@@ -417,7 +418,19 @@ async function handlePhotoUpload(ctx: Context, env: Env, tenant: TenantConfig): 
     // Extract invoice data using OCR
     await ctx.reply('🔍 Analizando la factura\\. Esto puede tomar unos segundos\\.\\.\\.\\.', { parse_mode: 'MarkdownV2' });
 
-    const extractedData = await extractInvoiceData(photoBuffer, env.AI, tenant.buyerRnc);
+    let extractedData: ExtractedInvoiceData | null;
+    try {
+      extractedData = await extractInvoiceData(photoBuffer, env.AI, tenant.buyerRnc);
+    } catch (error) {
+      if (!(error instanceof OcrUnavailableError)) throw error;
+      // Say the service is down, not that the photo is unclear, so users stop retaking photos
+      console.error('OCR unavailable:', error.message);
+      await ctx.reply(
+        '⚠️ El lector de facturas no está respondiendo en este momento\\. Intenta de nuevo en unos minutos o usa el método de URL\\.',
+        { parse_mode: 'MarkdownV2' }
+      );
+      return;
+    }
 
     if (!extractedData) {
       await ctx.reply(
@@ -1059,10 +1072,38 @@ function getBot(env: Env): Bot {
   return bot;
 }
 
+// Cloudflare cancels background work 30 s after the webhook answered. Giving up
+// at 25 s leaves time to tell the user, instead of the bot going silent.
+const UPDATE_DEADLINE_MS = 25_000;
+
 /**
- * Create webhook handler for Cloudflare Workers
+ * Process one Telegram update in the background, after the webhook has already
+ * answered 200. Warns the chat when processing fails or runs out of time.
  */
-export function createWebhookHandler(env: Env) {
+export async function processUpdate(env: Env, update: Update): Promise<void> {
   const bot = getBot(env);
-  return webhookCallback(bot, 'cloudflare-mod');
+  const chatId = update.message?.chat.id ?? update.callback_query?.message?.chat.id;
+  const tellChat = async (text: string) => {
+    if (!chatId) return;
+    await bot.api.sendMessage(chatId, text).catch((error) => console.error('Could not notify chat:', error));
+  };
+  let timer!: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), UPDATE_DEADLINE_MS);
+  });
+
+  try {
+    await bot.init();
+    const handling = bot.handleUpdate(update);
+    if (await Promise.race([handling, deadline]) === 'timeout') {
+      handling.catch((error) => console.error('Error after deadline:', error));
+      console.error(`Update ${update.update_id} still running after ${UPDATE_DEADLINE_MS} ms`);
+      await tellChat('⚠️ Esto tardó demasiado y puede que no se haya completado. Revisa e intenta de nuevo.');
+    }
+  } catch (error) {
+    console.error('Error processing update:', error);
+    await tellChat('❌ Ocurrió un error inesperado. Por favor intenta de nuevo.');
+  } finally {
+    clearTimeout(timer);
+  }
 }
